@@ -1,0 +1,64 @@
+name: TramitFlow - trabajador externo
+
+# Hace lo que las edge functions de Supabase no pueden: bajar de servidores
+# que cortan a Supabase o solo hablan TLS antiguo, leer boletines a dos
+# columnas y dar capa de texto (OCR) a PDFs escaneados.
+# Habla solo con la edge function pf-trabajador-externo, con la clave propia
+# del trabajador (secreto TRABAJADOR_CLAVE), nunca con la clave de servicio.
+#
+# Repositorio PUBLICO a proposito: GitHub no cobra los minutos de Actions de
+# los repositorios publicos. Por eso aqui se trabaja cada hora y con dos
+# carriles a la vez, cada uno con su propia cola:
+#   - textos: normas y documentos municipales (descarga, lectura, OCR si hace falta)
+#   - pdfs:   copias con capa de texto de PDFs ya guardados y fichas de ambito
+# Si no hay trabajo, cada carril termina en segundos sin instalar nada. Si una
+# ejecucion sigue en marcha, la siguiente espera (no se pisan).
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # cada hora
+  workflow_dispatch:
+    inputs:
+      presupuesto_min:
+        description: "Minutos de trabajo como maximo"
+        default: "150"
+
+permissions:
+  contents: read
+
+jobs:
+  trabajar:
+    strategy:
+      fail-fast: false
+      matrix:
+        carril: [textos, pdfs]
+    concurrency:
+      group: tramitflow-trabajador-externo-${{ matrix.carril }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 175
+    env:
+      TRABAJADOR_CLAVE: ${{ secrets.TRABAJADOR_CLAVE }}
+      PRESUPUESTO_MIN: ${{ inputs.presupuesto_min || '150' }}
+      MAX_TEXTOS: ${{ matrix.carril == 'textos' && '10' || '0' }}
+      MAX_PDFS: ${{ matrix.carril == 'pdfs' && '2' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/trabajador-externo
+
+      # Si no hay trabajo termina aqui, sin instalar nada.
+      - name: Hay trabajo?
+        id: contar
+        run: python3 scripts/trabajador-externo/externo.py contar
+
+      - name: Instalar poppler, qpdf y ocrmypdf
+        if: steps.contar.outputs.hay == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            poppler-utils qpdf ghostscript ocrmypdf tesseract-ocr tesseract-ocr-spa
+
+      - name: Trabajar
+        if: steps.contar.outputs.hay == 'true'
+        run: python3 scripts/trabajador-externo/externo.py trabajar
