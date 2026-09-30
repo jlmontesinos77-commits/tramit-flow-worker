@@ -77,6 +77,12 @@ MPX_UN_SOLO_PROCESO = 60               # paginas grandes: una a una, no dos a la
 # Red de seguridad: si aun asi ocrmypdf pasa de esta fraccion de la memoria de
 # la maquina, se le mata y el documento se da por fallido. Nunca el runner.
 FRACCION_MEMORIA_OCR = 0.70
+# 30/09: los textos largos (planes parciales, textos refundidos de 60-200
+# paginas) pasaban de la memoria aun con las paginas acotadas: ocrmypdf va
+# acumulando. Por encima de este numero de paginas el PDF se parte en trozos,
+# cada trozo se pasa por el OCR por separado y luego se vuelven a unir. El pico
+# de memoria pasa a depender del trozo, no del documento.
+PAGINAS_POR_TROZO = 20
 
 INICIO = time.time()
 
@@ -599,6 +605,27 @@ def ejecutar_vigilado(cmd: list[str], timeout: int) -> tuple[int, bytes]:
         return proc.returncode, err.read()
 
 
+def _ocr_trozo(plano: str, salida: str, forzar: bool) -> tuple[int, str]:
+    """Acota las paginas de gran formato y pasa ocrmypdf, vigilado.
+    Devuelve (codigo de ocrmypdf, nota del acotado)."""
+    plano, mayor, nota_acotar = acotar_paginas(plano, plano + ".acotado.pdf", forzar)
+    trabajos = 1 if mayor > MPX_UN_SOLO_PROCESO else (os.cpu_count() or 2)
+    codigo, err = ejecutar_vigilado(
+        ["ocrmypdf", "-l", "spa", "--force-ocr" if forzar else "--skip-text", "--optimize", "0", "--output-type", "pdf",
+         "--invalidate-digital-signatures", "--max-image-mpixels", "2000",
+         "--jobs", str(trabajos), plano, salida],
+        timeout=OCR_TIMEOUT_S)
+    if codigo not in (0, 6) or not os.path.exists(salida):
+        raise RuntimeError("ocrmypdf: " + _error_ocr(err))
+    return codigo, nota_acotar
+
+
+def _qpdf_paginas(args: list[str], salida: str, que: str):
+    r = subprocess.run(["qpdf", "--empty", "--pages", *args, "--", salida], capture_output=True, timeout=900)
+    if r.returncode not in (0, 3) or not os.path.exists(salida):
+        raise RuntimeError(f"qpdf no ha podido {que}: " + r.stderr.decode(errors="replace").strip()[-200:])
+
+
 def dar_capa_texto(entrada: str, salida: str, forzar: bool = False) -> str:
     """Prepara el PDF con qpdf y le da capa de texto con ocrmypdf.
 
@@ -617,32 +644,63 @@ def dar_capa_texto(entrada: str, salida: str, forzar: bool = False) -> str:
     - paginas de gran formato: ver acotar_paginas(). Y ocrmypdf corre
       vigilado (ejecutar_vigilado): un documento que se come la memoria
       falla el solo, no la ejecucion.
+    - 30/09, documentos largos: por encima de PAGINAS_POR_TROZO paginas se
+      parten en trozos, cada trozo va al OCR por separado y se vuelven a unir.
     """
     plano = entrada + ".plano.pdf"
     r = subprocess.run(["qpdf", "--decrypt", "--flatten-rotation", entrada, plano],
                        capture_output=True, timeout=600)
     if r.returncode not in (0, 3) or not os.path.exists(plano):  # 3 = avisos
         shutil.copy(entrada, plano)
-    plano, mayor, nota_acotar = acotar_paginas(plano, entrada + ".acotado.pdf", forzar)
-    trabajos = 1 if mayor > MPX_UN_SOLO_PROCESO else (os.cpu_count() or 2)
-    codigo, err = ejecutar_vigilado(
-        ["ocrmypdf", "-l", "spa", "--force-ocr" if forzar else "--skip-text", "--optimize", "0", "--output-type", "pdf",
-         "--invalidate-digital-signatures", "--max-image-mpixels", "2000",
-         "--jobs", str(trabajos), plano, salida],
-        timeout=OCR_TIMEOUT_S)
-    if codigo not in (0, 6) or not os.path.exists(salida):
-        raise RuntimeError("ocrmypdf: " + _error_ocr(err))
+
+    n = len(_paginas(plano))
+    if n <= PAGINAS_POR_TROZO:
+        codigo, nota_acotar = _ocr_trozo(plano, salida, forzar)
+        trozos_nota = ""
+    else:
+        d = os.path.dirname(salida)
+        hechos: list[str] = []
+        codigos: set[int] = set()
+        acotados: list[str] = []
+        for i, desde in enumerate(range(1, n + 1, PAGINAS_POR_TROZO), start=1):
+            hasta = min(desde + PAGINAS_POR_TROZO - 1, n)
+            trozo = os.path.join(d, f"trozo-{i}.pdf")
+            _qpdf_paginas([plano, f"{desde}-{hasta}"], trozo, f"separar las paginas {desde}-{hasta}")
+            ocr = os.path.join(d, f"trozo-{i}-ocr.pdf")
+            try:
+                c, na = _ocr_trozo(trozo, ocr, forzar)
+            except RuntimeError as e:
+                raise RuntimeError(f"paginas {desde}-{hasta}: {e}") from None
+            codigos.add(c)
+            if na:
+                acotados.append(f"p{desde}-{hasta}: {na}")
+            os.remove(trozo)
+            hechos.append(ocr)
+            log(f"   trozo {i}: paginas {desde}-{hasta} hechas")
+        args: list[str] = []
+        for h in hechos:
+            args += [h, "1-z"]
+        _qpdf_paginas(args, salida, "unir los trozos")
+        for h in hechos:
+            os.remove(h)
+        codigo = 0 if 0 in codigos else 6
+        nota_acotar = "; ".join(acotados)[:300]
+        trozos_nota = f"en {len(hechos)} trozos de {PAGINAS_POR_TROZO} paginas"
+
     if forzar:
         nota = "ocr forzado (capa de texto ilegible)"
     else:
         nota = "ocr" if codigo == 0 else "ya tenia texto"
-    return nota + ("; " + nota_acotar if nota_acotar else "")
+    for extra in (trozos_nota, nota_acotar):
+        if extra:
+            nota += "; " + extra
+    return nota
 
 
 def ajustar_tamano(ruta: str, d: str) -> tuple[str, str]:
-    """El bucket admite 50 MB. Si la copia con OCR pasa, se recomprime la
-    imagen con ghostscript (la capa de texto se conserva). Devuelve la ruta
-    final y una nota."""
+    """El bucket admite 50 MB. Si la copia pasa, se recomprime la imagen con
+    ghostscript (la capa de texto se conserva). Devuelve la ruta final y una
+    nota."""
     if os.path.getsize(ruta) <= MAX_SUBIDA:
         return ruta, ""
     for ajuste in ("/ebook", "/screen"):
@@ -652,7 +710,7 @@ def ajustar_tamano(ruta: str, d: str) -> tuple[str, str]:
                            capture_output=True, timeout=1800)
         if r.returncode == 0 and os.path.exists(salida) and os.path.getsize(salida) <= MAX_SUBIDA:
             return salida, f"recomprimido {ajuste}"
-    raise RuntimeError(f"la copia con OCR pesa {os.path.getsize(ruta) // 1048576} MB y el bucket admite 50 MB")
+    raise RuntimeError(f"la copia pesa {os.path.getsize(ruta) // 1048576} MB incluso recomprimida y el bucket admite 50 MB")
 
 
 def texto_de_pdf(datos: bytes) -> tuple[str, str]:
@@ -833,14 +891,23 @@ def hacer_pdf(p: dict):
             f, o = os.path.join(d, "in.pdf"), os.path.join(d, "out.pdf")
             with open(f, "wb") as fh:
                 fh.write(datos)
-            previo, _ = pdftotext(f)
-            nota = dar_capa_texto(f, o, forzar=texto_util(previo) >= 2000 and ilegible(previo))
-            t, modo = pdftotext(o)
-            if texto_util(t) < 200:
-                raise RuntimeError("tras el OCR sigue sin texto legible")
-            final, reduccion = ajustar_tamano(o, d)
-            if reduccion:
-                nota += "; " + reduccion
+            if p.get("solo_comprimir"):
+                # 30/09: normas cuyo PDF pasa de 50 MB y que ya tienen su texto
+                # en la base (PGOU con los planos dentro). Solo hace falta
+                # nuestra copia: se comprime con ghostscript, SIN OCR (el OCR
+                # de esas paginas de plano solo daba errores de memoria).
+                final, reduccion = ajustar_tamano(f, d)
+                nota = "solo compresion, sin OCR" + ("; " + reduccion if reduccion else "")
+                t, modo = pdftotext(final)
+            else:
+                previo, _ = pdftotext(f)
+                nota = dar_capa_texto(f, o, forzar=texto_util(previo) >= 2000 and ilegible(previo))
+                t, modo = pdftotext(o)
+                if texto_util(t) < 200:
+                    raise RuntimeError("tras el OCR sigue sin texto legible")
+                final, reduccion = ajustar_tamano(o, d)
+                if reduccion:
+                    nota += "; " + reduccion
             with open(final, "rb") as fh:
                 cuerpo = fh.read()
         req = urllib.request.Request(p["subida"], data=cuerpo, method="PUT",
@@ -889,9 +956,14 @@ def trabajar():
         while queda() > 20 * 60:  # sin margen para un OCR largo no se toma nada mas
             ronda += 1
             try:
+                # "admite": lo que sabe hacer esta version. La puerta no le da
+                # tareas «solo comprimir» a un trabajador que no las conoce
+                # (les pasaria el OCR, que es justo lo que hay que evitar), ni
+                # reintentos por trozos a uno que no sabe trocear.
                 r = puerta({"modo": "tareas",
                             "max_textos": int(os.environ.get("MAX_TEXTOS", "10")),
-                            "max_pdfs": int(os.environ.get("MAX_PDFS", "2"))})
+                            "max_pdfs": int(os.environ.get("MAX_PDFS", "2")),
+                            "admite": ["solo_comprimir", "trocear"]})
             except PuertaNoDisponible as e:
                 # Lo ya hecho esta devuelto; lo que no se ha tomado sigue en la cola.
                 print(f"::warning::la puerta no responde, se para aqui ({str(e)[:200]})")
