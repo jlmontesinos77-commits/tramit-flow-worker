@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        carril: [textos, pdfs, vistas]
+        carril: [textos, pdfs, vistas, registros]
     concurrency:
       group: tramitflow-trabajador-externo-${{ matrix.carril }}
       cancel-in-progress: false
@@ -44,6 +44,7 @@ jobs:
       MAX_TEXTOS: ${{ matrix.carril == 'textos' && '10' || '0' }}
       MAX_PDFS: ${{ matrix.carril == 'pdfs' && '2' || '0' }}
       MAX_VISTAS: ${{ matrix.carril == 'vistas' && '20' || '0' }}
+      MAX_REGISTROS: ${{ matrix.carril == 'registros' && '10' || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,7 +56,7 @@ jobs:
         run: python3 scripts/trabajador-externo/externo.py contar
 
       - name: Instalar poppler, qpdf y ocrmypdf
-        if: steps.contar.outputs.hay == 'true'
+        if: steps.contar.outputs.hay == 'true' && matrix.carril != 'registros'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \

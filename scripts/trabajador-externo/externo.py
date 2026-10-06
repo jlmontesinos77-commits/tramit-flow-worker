@@ -1266,6 +1266,165 @@ def hacer_ficha(f: dict):
     log("   ->", json.dumps(res, ensure_ascii=False)[:200])
 
 
+# ---------------------------------------------------------------- REGISTROS
+# 06/10: registros autonomicos de planeamiento que cortan a las IP de Supabase
+# (el de la GVA deja colgado el saludo TLS). Carril "registros": toma turnos de
+# municipio en la puerta, lee el indice y devuelve inventario y documentos con
+# "registro_guardar". Es rastreo automatico: robots.txt se respeta (el de
+# mediambient.gva.es permite /auto/urbanismo/ a un agente generico). Lo que hay
+# que bajar lo decide la base (solo para municipios dados de alta) y entra en
+# la cola de textos de siempre.
+
+GVA = "https://mediambient.gva.es/auto/urbanismo/reg-planeamiento"
+GVA_PROV = {"03": "2%20ALICANTE", "12": "3%20CASTELL%D3N", "46": "4%20VALENCIA"}
+GVA_TOPE_LISTADOS = 120
+PAUSA_LISTADO = 0.4
+PAUSA_MUNICIPIO = 3
+_PROV_CACHE: dict[str, list[str]] = {}
+
+
+def _sin_tildes(t: str) -> str:
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFD", t) if unicodedata.category(c) != "Mn").lower()
+
+
+def clase_registro(ruta: str, nombre: str) -> str:
+    """La misma regla que pf-registro-autonomico: planos y fichas antes que normas."""
+    t = _sin_tildes(ruta + " / " + nombre)
+    n = _sin_tildes(nombre)
+    if re.search(r"\bplanos?\b", n) or (re.search(r"\bplanos?\b", t)
+                                         and not re.search(r"\bnormas?\b|ordenanza|catalogo|memoria", n)):
+        return "plano"
+    if re.search(r"\bfichas?\b", t):
+        return "ficha_ambito"
+    if "catalogo" in t:
+        return "catalogo_proteccion"
+    if re.search(r"\bnormas?\b|ordenanzas?|normativa", t):
+        return "planeamiento"
+    return "documento_auxiliar"
+
+
+def listar_gva(url: str) -> list[str]:
+    time.sleep(PAUSA_LISTADO)
+    datos, cab, _ = _bajar_crudo(url + "/", comprobar_robots=True, maximo=4 * 1024 * 1024)
+    texto = datos.decode("latin-1", errors="replace")
+    out, vistos = [], set()
+    for parte in texto.split('href="')[1:]:
+        h = parte.split('"', 1)[0]
+        if not h or h.startswith(("http", "?", "/")) or h in vistos:
+            continue
+        vistos.add(h)
+        out.append(h)
+    return out
+
+
+def des_gva(s: str) -> str:
+    """Los nombres van en LATIN-1 escapado en la URL."""
+    crudo = urllib.parse.unquote_to_bytes(s)
+    try:
+        t = crudo.decode("utf-8")
+    except UnicodeDecodeError:
+        t = crudo.decode("latin-1")
+    return t[:-1] if t.endswith("/") else t
+
+
+def leer_gva(ine: str) -> tuple[list, list]:
+    prov = GVA_PROV.get(ine[:2])
+    if not prov:
+        raise RuntimeError("la provincia no esta en el registro de la GVA")
+    raiz = GVA + "/" + prov
+    if prov not in _PROV_CACHE:
+        _PROV_CACHE[prov] = listar_gva(raiz)
+    carpeta = next((c for c in _PROV_CACHE[prov] if c.startswith(ine + "%20") or c.startswith(ine + " ")), None)
+    if not carpeta:
+        return [], []
+    mu = raiz + "/" + carpeta.rstrip("/")
+    listados, parcial = 1, False
+    figuras, docs = [], []
+    for n1 in listar_gva(mu):
+        if not n1.endswith("/"):
+            continue
+        listados += 1
+        tipo = des_gva(n1)
+        ruta_n1 = mu + "/" + n1[:-1]
+        general = bool(re.match(r"^1\b", tipo)) or "GENERAL" in tipo.upper()
+        for exp in listar_gva(ruta_n1):
+            if not exp.endswith("/"):
+                continue
+            nombre = des_gva(exp)
+            m = re.match(r"^(\d{5}-\d{3,4})\s+(.*)$", nombre)
+            a = re.search(r"((?:19|20)\d{2})[ -]\d{3,4}\s*$", nombre) or re.search(r"\b((?:19|20)\d{2})\b", nombre)
+            fid = tipo + " / " + nombre
+            ruta_exp = ruta_n1 + "/" + exp[:-1]
+            figuras.append({"figura_id": fid, "figura": (m.group(2) if m else nombre).strip(), "fecha": None,
+                            "estado": "", "adaptacion": "", "url": ruta_exp + "/",
+                            "datos": {"tipo": tipo, "codigo": m.group(1) if m else None,
+                                      "anio": a.group(1) if a else None}})
+            if not general:
+                continue
+            if listados >= GVA_TOPE_LISTADOS:
+                parcial = True
+                continue
+            listados += 1
+            for carp in listar_gva(ruta_exp):
+                if not carp.endswith("/"):
+                    continue
+                nc = des_gva(carp)
+                if not re.search(r"norma|ordenanza|catalogo", _sin_tildes(nc)):
+                    continue
+                if listados >= GVA_TOPE_LISTADOS:
+                    parcial = True
+                    break
+                listados += 1
+                ruta_carp = ruta_exp + "/" + carp[:-1]
+                for f in listar_gva(ruta_carp):
+                    if not f.lower().endswith(".pdf"):
+                        continue
+                    nf = des_gva(f)
+                    docs.append({"figura_id": fid, "doc_id": fid + " / " + nc + " / " + nf, "expediente": nombre,
+                                 "ruta": fid + " / " + nc, "nombre": nf, "url": ruta_carp + "/" + f,
+                                 "clase": clase_registro(nc, nf),
+                                 # la base solo lo baja si el municipio esta dado de alta
+                                 "bajar": True})
+    if parcial and figuras:
+        figuras[0]["datos"]["parcial"] = f"tope de {GVA_TOPE_LISTADOS} listados: documentos incompletos"
+    return figuras, docs
+
+
+LECTORES_REGISTRO = {"gva": leer_gva}
+
+
+def hacer_registros():
+    try:
+        r = puerta({"modo": "registro_tomar", "limite": int(os.environ.get("MAX_REGISTROS", "10"))})
+    except PuertaNoDisponible as e:
+        print(f"::warning::la puerta no responde ({str(e)[:200]})")
+        return
+    turnos = r.get("turnos") or []
+    log(f"registros: {len(turnos)} municipios")
+    for i, t in enumerate(turnos):
+        reg, ine = t.get("registro"), t.get("municipio_ine")
+        lector = LECTORES_REGISTRO.get(reg)
+        cuerpo = {"modo": "registro_guardar", "registro": reg, "municipio_ine": ine}
+        try:
+            if not lector:
+                raise RuntimeError(f"este trabajador no sabe leer el registro {reg}")
+            figuras, docs = lector(ine)
+            cuerpo.update(figuras=figuras, docs=docs)
+            log(f"   {reg} {ine}: {len(figuras)} figuras, {len(docs)} documentos")
+        except (Vetado, HostSaturado) as e:
+            cuerpo["error"] = f"{type(e).__name__}: {str(e)[:250]}"
+        except Exception as e:
+            cuerpo["error"] = f"{type(e).__name__}: {str(e)[:250]}"
+        try:
+            res = puerta(cuerpo)
+            log("   ->", json.dumps(res, ensure_ascii=False)[:200])
+        except PuertaNoDisponible as e:
+            log("   no se ha podido devolver:", str(e)[:200])
+        if i < len(turnos) - 1:
+            time.sleep(PAUSA_MUNICIPIO)
+
+
 def contar():
     try:
         r = puerta({"modo": "contar"})
@@ -1278,10 +1437,12 @@ def contar():
     quiere_textos = int(os.environ.get("MAX_TEXTOS", "10")) > 0
     quiere_pdfs = int(os.environ.get("MAX_PDFS", "2")) > 0
     quiere_vistas = int(os.environ.get("MAX_VISTAS", "0")) > 0
+    quiere_registros = int(os.environ.get("MAX_REGISTROS", "0")) > 0
     # Las fichas de sede (HTML ligero) van con el carril de textos.
     hay = bool((quiere_textos and (r.get("textos") or r.get("fichas_html")))
                or (quiere_pdfs and r.get("pdfs"))
-               or (quiere_vistas and r.get("vistas")))
+               or (quiere_vistas and r.get("vistas"))
+               or (quiere_registros and r.get("registros")))
     salida = os.environ.get("GITHUB_OUTPUT")
     if salida:
         with open(salida, "a") as fh:
@@ -1291,6 +1452,10 @@ def contar():
 def trabajar():
     signal.signal(signal.SIGTERM, _cortar)
     signal.signal(signal.SIGINT, _cortar)
+    if int(os.environ.get("MAX_REGISTROS", "0")) > 0:
+        # carril de registros: solo lectura de indices, sin colas de textos ni PDFs
+        hacer_registros()
+        return
     ronda = 0
     motivo = "fin de la ejecucion"
     try:
