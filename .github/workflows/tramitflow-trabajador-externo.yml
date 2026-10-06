@@ -11,6 +11,7 @@ name: TramitFlow - trabajador externo
 # carriles a la vez, cada uno con su propia cola:
 #   - textos: normas y documentos municipales (descarga, lectura, OCR si hace falta)
 #   - pdfs:   copias con capa de texto de PDFs ya guardados y fichas de ambito
+#   - vistas: copia ligera (150 ppp) de cada plano, para verlo en pantalla
 # Si no hay trabajo, cada carril termina en segundos sin instalar nada. Si una
 # ejecucion sigue en marcha, la siguiente espera (no se pisan).
 
@@ -31,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        carril: [textos, pdfs]
+        carril: [textos, pdfs, vistas]
     concurrency:
       group: tramitflow-trabajador-externo-${{ matrix.carril }}
       cancel-in-progress: false
@@ -42,6 +43,7 @@ jobs:
       PRESUPUESTO_MIN: ${{ inputs.presupuesto_min || '150' }}
       MAX_TEXTOS: ${{ matrix.carril == 'textos' && '10' || '0' }}
       MAX_PDFS: ${{ matrix.carril == 'pdfs' && '2' || '0' }}
+      MAX_VISTAS: ${{ matrix.carril == 'vistas' && '20' || '0' }}
     steps:
       - uses: actions/checkout@v4
         with:

@@ -1058,13 +1058,15 @@ def resolver(url: str, via: str, profundidad: int = 0, robots: bool = True) -> t
 # tiempo agotado)- sin gastar intento: la siguiente ejecucion sigue donde lo
 # dejo esta. Si ni eso se puede avisar (runner muerto de golpe), la base lo
 # devuelve sola a las 3 h, tambien sin gastar intento.
-EN_MANO: dict[str, set] = {"textos": set(), "pdfs": set()}
-RETENIDAS: dict[str, set] = {"textos": set(), "pdfs": set()}
+EN_MANO: dict[str, set] = {"textos": set(), "pdfs": set(), "vistas": set()}
+RETENIDAS: dict[str, set] = {"textos": set(), "pdfs": set(), "vistas": set()}
 
 
 def soltar(motivo: str):
     textos = sorted(EN_MANO["textos"] | RETENIDAS["textos"])
     pdfs = sorted(EN_MANO["pdfs"] | RETENIDAS["pdfs"])
+    # las vistas viajan con los pdfs, con su prefijo
+    pdfs += ["vista:" + x for x in sorted(EN_MANO["vistas"] | RETENIDAS["vistas"])]
     if not textos and not pdfs:
         return
     # Una sola peticion y corta: tras la senal de cancelar GitHub da unos 10 s
@@ -1075,7 +1077,7 @@ def soltar(motivo: str):
     try:
         with urllib.request.urlopen(req, timeout=6, context=CTX[0]) as r:
             log("soltadas:", r.read().decode(errors="replace")[:200])
-        for k in ("textos", "pdfs"):
+        for k in ("textos", "pdfs", "vistas"):
             EN_MANO[k].clear()
             RETENIDAS[k].clear()
     except Exception as e:
@@ -1166,6 +1168,80 @@ def hacer_pdf(p: dict):
     log("   ->", json.dumps(res, ensure_ascii=False)[:300])
 
 
+# 06/10: COPIA LIGERA DE LOS PLANOS PARA VERLOS EN PANTALLA. Los planos de los
+# planes generales son escaneados de 5 a 50 MB; el visor tenia que bajar el PDF
+# entero y pintar la imagen completa antes de ensenar nada. Aqui se saca una
+# copia a 150 ppp (imagenes en color y gris a JPEG, las de un bit a 300 ppp),
+# linealizada para que el visor pueda empezar a pintar antes de tenerla entera.
+# El original no se toca: el boton «PDF» del visor sigue llevando a el.
+VISTA_PPP = 150
+VISTA_PPP_MONO = 300
+VISTA_GANANCIA_MIN = 0.8   # si la copia no baja del 80 % del original, no compensa
+
+
+def copia_ligera(entrada: str, d: str) -> str:
+    salida = os.path.join(d, "vista-gs.pdf")
+    r = subprocess.run(
+        ["gs", "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER", "-sDEVICE=pdfwrite",
+         "-dCompatibilityLevel=1.5", "-dDetectDuplicateImages=true",
+         "-dDownsampleColorImages=true", "-dColorImageDownsampleType=/Bicubic",
+         f"-dColorImageResolution={VISTA_PPP}", "-dColorImageDownsampleThreshold=1.2",
+         "-dAutoFilterColorImages=false", "-dColorImageFilter=/DCTEncode",
+         "-dDownsampleGrayImages=true", "-dGrayImageDownsampleType=/Bicubic",
+         f"-dGrayImageResolution={VISTA_PPP}", "-dGrayImageDownsampleThreshold=1.2",
+         "-dAutoFilterGrayImages=false", "-dGrayImageFilter=/DCTEncode",
+         "-dDownsampleMonoImages=true", "-dMonoImageDownsampleType=/Subsample",
+         f"-dMonoImageResolution={VISTA_PPP_MONO}", "-dJPEGQ=75",
+         "-sOutputFile=" + salida, entrada],
+        capture_output=True, timeout=1200)
+    if r.returncode != 0 or not os.path.exists(salida) or os.path.getsize(salida) < 1024:
+        raise RuntimeError("ghostscript: " + (r.stderr or b"").decode(errors="replace")[-200:].strip())
+    lineal = os.path.join(d, "vista.pdf")
+    q = subprocess.run(["qpdf", "--linearize", salida, lineal], capture_output=True, timeout=600)
+    # qpdf sale con 3 si solo hay avisos: el fichero vale
+    if q.returncode in (0, 3) and os.path.exists(lineal) and os.path.getsize(lineal) > 1024:
+        return lineal
+    return salida
+
+
+def hacer_vista(v: dict):
+    log(f"vista {v['plano_id']}")
+    try:
+        datos, _, _ = bajar_documento(v["descarga"], robots=False)
+        if not es_pdf(datos):
+            raise RuntimeError("la descarga no es un PDF")
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "in.pdf")
+            with open(f, "wb") as fh:
+                fh.write(datos)
+            final = copia_ligera(f, d)
+            tam = os.path.getsize(final)
+            if tam >= len(datos) * VISTA_GANANCIA_MIN:
+                res = puerta({"modo": "vista", "plano_id": v["plano_id"], "sin_mejora": True,
+                              "nota": f"{len(datos) // 1024} KB -> {tam // 1024} KB: no compensa, se ve el original"})
+                log("   ->", json.dumps(res, ensure_ascii=False)[:200])
+                return
+            with open(final, "rb") as fh:
+                cuerpo = fh.read()
+        req = urllib.request.Request(v["subida"], data=cuerpo, method="PUT",
+                                     headers={"Content-Type": "application/pdf", "x-upsert": "true",
+                                              "cache-control": "max-age=31536000"})
+        try:
+            with urllib.request.urlopen(req, timeout=600, context=CTX[0]) as r:
+                r.read()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"subida {e.code}: {e.read().decode(errors='replace')[:200]}") from None
+        res = puerta({"modo": "vista", "plano_id": v["plano_id"], "ruta": v["ruta"],
+                      "nota": f"{len(datos) // 1024} KB -> {len(cuerpo) // 1024} KB ({VISTA_PPP} ppp)"})
+    except HostSaturado as e:
+        log("   se retiene y se devuelve al final:", e)
+        RETENIDAS["vistas"].add(v["plano_id"])
+        return
+    except Exception as e:
+        res = puerta({"modo": "vista", "plano_id": v["plano_id"], "error": str(e)[:300]})
+    log("   ->", json.dumps(res, ensure_ascii=False)[:200])
+
+
 def hacer_ficha(f: dict):
     """06/10: fichas de sedes que cortan a la IP de Supabase (Murcia). Es
     rastreo automatico: se respeta robots.txt y la pausa por servidor. Solo se
@@ -1201,9 +1277,11 @@ def contar():
     # Cada carril (textos / pdfs) solo arranca si hay trabajo de lo suyo.
     quiere_textos = int(os.environ.get("MAX_TEXTOS", "10")) > 0
     quiere_pdfs = int(os.environ.get("MAX_PDFS", "2")) > 0
+    quiere_vistas = int(os.environ.get("MAX_VISTAS", "0")) > 0
     # Las fichas de sede (HTML ligero) van con el carril de textos.
     hay = bool((quiere_textos and (r.get("textos") or r.get("fichas_html")))
-               or (quiere_pdfs and r.get("pdfs")))
+               or (quiere_pdfs and r.get("pdfs"))
+               or (quiere_vistas and r.get("vistas")))
     salida = os.environ.get("GITHUB_OUTPUT")
     if salida:
         with open(salida, "a") as fh:
@@ -1229,16 +1307,19 @@ def trabajar():
                             # fichas de sede: solo el carril de textos
                             "max_fichas": int(os.environ.get("MAX_FICHAS", "40"))
                                           if int(os.environ.get("MAX_TEXTOS", "10")) > 0 else 0,
-                            "admite": ["solo_comprimir", "trocear", "fichas", "sin_robots"]})
+                            "max_vistas": int(os.environ.get("MAX_VISTAS", "0")),
+                            "admite": ["solo_comprimir", "trocear", "fichas", "sin_robots", "vistas"]})
             except PuertaNoDisponible as e:
                 # Lo ya hecho esta devuelto; lo que no se ha tomado sigue en la cola.
                 print(f"::warning::la puerta no responde, se para aqui ({str(e)[:200]})")
                 break
             textos, pdfs = r.get("textos") or [], r.get("pdfs") or []
             fichas = r.get("fichas_html") or []
-            log(f"ronda {ronda}: {len(textos)} textos, {len(pdfs)} pdfs, {len(fichas)} fichas")
-            if not textos and not pdfs and not fichas:
+            vistas = r.get("vistas") or []
+            log(f"ronda {ronda}: {len(textos)} textos, {len(pdfs)} pdfs, {len(fichas)} fichas, {len(vistas)} vistas")
+            if not textos and not pdfs and not fichas and not vistas:
                 break
+            EN_MANO["vistas"].update(v["plano_id"] for v in vistas)
             EN_MANO["textos"].update(t["id"] for t in textos)
             EN_MANO["pdfs"].update(p["documento_id"] for p in pdfs)
             # Ninguna tarea puede tumbar la ejecucion: cualquier error (un 401 de
@@ -1269,6 +1350,16 @@ def trabajar():
                 except Exception as e:
                     print(f"::warning::pdf {p.get('documento_id')}: {type(e).__name__}: {str(e)[:200]}", flush=True)
                 EN_MANO["pdfs"].discard(p["documento_id"])
+            for v in vistas:
+                if queda() < 5 * 60:
+                    break  # las no hechas se sueltan al final
+                try:
+                    hacer_vista(v)
+                except PuertaNoDisponible as e:
+                    log("   no se ha podido devolver:", str(e)[:200])
+                except Exception as e:
+                    print(f"::warning::vista {v.get('plano_id')}: {type(e).__name__}: {str(e)[:200]}", flush=True)
+                EN_MANO["vistas"].discard(v["plano_id"])
     except SystemExit as e:
         motivo = str(e)
         print(f"::warning::{motivo}; se devuelve a la cola lo que quedaba en mano", flush=True)
