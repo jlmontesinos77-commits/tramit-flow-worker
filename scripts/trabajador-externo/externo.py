@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import html
 import html.parser
+import http.cookiejar
 import json
 import os
 import re
@@ -116,6 +117,17 @@ def _ctx_antiguo() -> ssl.SSLContext:
 
 
 CTX = [_ctx_moderno(), _ctx_antiguo()]
+
+# 06/10: SESION DE NAVEGACION. Hay portales oficiales que solo entregan el
+# documento a quien llega con la cookie de sesion de haberlos visitado: el
+# registro de planeamiento de la Junta de Andalucia (SITUA) contesta a
+# descargaDocumentos.jsf?doc=N con su pagina HTML si no hay sesion, y con el PDF
+# si la hay. Las descargas comparten un tarro de cookies durante la ejecucion
+# (como un navegador) y, si un documento llega como pagina, se pide la sesion
+# visitando su carpeta y la portada y se repite una vez (bajar_documento).
+COOKIES = http.cookiejar.CookieJar()
+ABRIDORES = [urllib.request.build_opener(urllib.request.HTTPSHandler(context=c),
+                                         urllib.request.HTTPCookieProcessor(COOKIES)) for c in CTX]
 
 
 # --------------------------------------------------------------------------
@@ -263,11 +275,11 @@ def _bajar_crudo(url: str, comprobar_robots: bool = True, maximo: int = MAX_BYTE
     if espera > 0:
         time.sleep(espera)
     ultimo_error: Exception | None = None
-    for ctx in CTX:
+    for abridor in ABRIDORES:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*",
                                                        "Accept-Language": "es-ES,es;q=0.9"})
-            with urllib.request.urlopen(req, timeout=90, context=ctx) as r:
+            with abridor.open(req, timeout=90) as r:
                 _ULTIMO_HOST[host] = time.time()
                 datos = r.read(maximo + 1)
                 if len(datos) > maximo:
@@ -294,6 +306,53 @@ def _bajar_crudo(url: str, comprobar_robots: bool = True, maximo: int = MAX_BYTE
                 raise HostSaturado(f"{host} no contesta (timeout {_TIMEOUTS_SEGUIDOS[host]})") from None
             continue  # segundo intento con TLS antiguo
     raise RuntimeError(f"no se ha podido bajar: {ultimo_error}")
+
+
+_CON_SESION: set[str] = set()
+
+
+def _cookies_de(host: str) -> int:
+    return sum(1 for c in COOKIES if host.endswith(c.domain.lstrip(".")))
+
+
+def calentar_sesion(url: str, robots: bool) -> bool:
+    """Visita la carpeta del documento, la primera carpeta del sitio y la
+    portada (en ese orden, hasta recibir cookie) para tener sesion en el host.
+    Una sola vez por host y ejecucion. Devuelve True si hay cookie nueva."""
+    u = urllib.parse.urlsplit(url)
+    host, origen = u.hostname or "", f"{u.scheme}://{u.netloc}"
+    if origen in _CON_SESION:
+        return False
+    _CON_SESION.add(origen)
+    antes = _cookies_de(host)
+    trozos = [x for x in u.path.split("/") if x]
+    rutas = ["/" + "/".join(trozos[:-1]) + "/" if len(trozos) > 1 else "/",
+             "/" + trozos[0] + "/" if trozos else "/", "/"]
+    for ruta in dict.fromkeys(rutas):
+        try:
+            _bajar_crudo(origen + ruta, comprobar_robots=robots, maximo=4 * 1024 * 1024)
+        except (Vetado, HostSaturado):
+            raise
+        except Exception as e:
+            log("   sesion:", origen + ruta, "->", e)
+        if _cookies_de(host) > antes:
+            log("   sesion recibida en", origen + ruta)
+            return True
+    return False
+
+
+def bajar_documento(url: str, robots: bool = True, maximo: int = MAX_BYTES):
+    """Como _bajar_crudo, pero si lo que llega es una pagina casi vacia en vez
+    del documento, pide sesion al portal y repite una vez."""
+    datos, cab, cod = _bajar_crudo(url, comprobar_robots=robots, maximo=maximo)
+    if es_pdf(datos) or es_word(datos):
+        return datos, cab, cod
+    tipo = (cab.get("Content-Type") or "").lower() if cab else ""
+    if "html" in tipo and len(datos) < 300_000:
+        texto, _ = html_a_texto(_decodificar(datos, cab))
+        if texto_util(texto) < 1500 and calentar_sesion(url, robots):
+            return _bajar_crudo(url, comprobar_robots=robots, maximo=maximo)
+    return datos, cab, cod
 
 
 def _charset_cabecera(cab) -> str | None:
@@ -813,7 +872,7 @@ def resolver(url: str, via: str, profundidad: int = 0, robots: bool = True) -> t
     persona, o un documento que Jose deja guardado, no lo trae un robot, y se
     baja aunque el robots.txt del portal lo prohiba (criterio de Jose, 29/09).
     """
-    datos, cab, _ = _bajar_crudo(url, comprobar_robots=robots)
+    datos, cab, _ = bajar_documento(url, robots=robots)
     if es_pdf(datos):
         return texto_de_pdf(datos)
     word = es_word(datos)
@@ -925,7 +984,7 @@ def hacer_pdf(p: dict):
         # el PDF viene de nuestro propio Storage o de la url oficial ya
         # registrada: si es de fuera, se respeta robots igualmente.
         propio = "supabase.co/storage/" in p["descarga"]
-        datos, _, _ = _bajar_crudo(p["descarga"], comprobar_robots=not propio)
+        datos, _, _ = bajar_documento(p["descarga"], robots=not propio)
         if not es_pdf(datos):
             raise RuntimeError("la descarga no es un PDF")
         with tempfile.TemporaryDirectory() as d:
