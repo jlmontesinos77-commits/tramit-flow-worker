@@ -774,9 +774,14 @@ def _pdfs_enlazados(base: str, enlaces: list[tuple[str, str]]) -> list[str]:
     return [u for _, _, u in sorted(cand)]
 
 
-def resolver(url: str, via: str, profundidad: int = 0) -> tuple[str, str]:
-    """Devuelve (texto, formato). Sigue como mucho un salto: de la ficha al PDF."""
-    datos, cab, _ = _bajar_crudo(url)
+def resolver(url: str, via: str, profundidad: int = 0, robots: bool = True) -> tuple[str, str]:
+    """Devuelve (texto, formato). Sigue como mucho un salto: de la ficha al PDF.
+
+    robots=False solo para lo aportado a mano (06/10): un enlace que pega una
+    persona, o un documento que Jose deja guardado, no lo trae un robot, y se
+    baja aunque el robots.txt del portal lo prohiba (criterio de Jose, 29/09).
+    """
+    datos, cab, _ = _bajar_crudo(url, comprobar_robots=robots)
     if es_pdf(datos):
         return texto_de_pdf(datos)
 
@@ -788,7 +793,7 @@ def resolver(url: str, via: str, profundidad: int = 0) -> tuple[str, str]:
         for href, _ in enlaces:
             if re.search(r"(ficha|detalle|Legislacion.*\d)", href, re.I):
                 try:
-                    return resolver(_absoluta(url, href), via, profundidad + 1)
+                    return resolver(_absoluta(url, href), via, profundidad + 1, robots)
                 except Vetado:
                     raise
                 except Exception as e:
@@ -804,7 +809,7 @@ def resolver(url: str, via: str, profundidad: int = 0) -> tuple[str, str]:
     # boletines con visor)
     for pdf in _pdfs_enlazados(url, enlaces)[:4]:
         try:
-            t, modo = resolver(pdf, via, profundidad + 1)
+            t, modo = resolver(pdf, via, profundidad + 1, robots)
             if texto_util(t) > texto_util(texto):
                 return t, modo + " (enlazado)"
         except Vetado:
@@ -858,9 +863,10 @@ def _cortar(signum, _frame):
 # --------------------------------------------------------------------------
 def hacer_texto(t: dict):
     url, via = t.get("url"), t.get("via") or "?"
-    log(f"texto {t['id']} [{via}] {url}")
+    a_mano = bool(t.get("a_mano"))
+    log(f"texto {t['id']} [{via}]{' [aportado a mano: sin robots.txt]' if a_mano else ''} {url}")
     try:
-        texto, formato = resolver(url, via)
+        texto, formato = resolver(url, via, robots=not a_mano)
         texto = texto.replace("\x00", "")
         if texto_util(texto) < MIN_TEXTO:
             res = puerta({"modo": "texto", "id": t["id"],
