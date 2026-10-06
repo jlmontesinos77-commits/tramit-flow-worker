@@ -323,6 +323,38 @@ def es_pdf(datos: bytes) -> bool:
     return datos[:1024].lstrip().startswith(b"%PDF") or b"%PDF-" in datos[:1024]
 
 
+# 06/10: ordenanzas publicadas en Word (Cadiz: .doc). Antes se leian como PDF
+# y fallaban con «Invalid PDF structure».
+def es_word(datos: bytes) -> str | None:
+    if datos[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+        return "doc"
+    if datos[:2] == b"PK" and b"word/" in datos[:4096]:
+        return "docx"
+    return None
+
+
+def texto_de_word(datos: bytes, tipo: str) -> tuple[str, str]:
+    if tipo == "docx":
+        import io
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(datos)) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "replace")
+        xml = re.sub(r"</w:p>", "\n", xml)
+        xml = re.sub(r"<w:tab/>", "\t", xml)
+        t = html.unescape(re.sub(r"<[^>]+>", "", xml))
+        return t, "docx"
+    if not shutil.which("antiword"):
+        raise RuntimeError("documento Word .doc y no esta instalado antiword")
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "in.doc")
+        with open(f, "wb") as fh:
+            fh.write(datos)
+        r = subprocess.run(["antiword", "-w", "0", f], capture_output=True, timeout=300)
+        if r.returncode != 0:
+            raise RuntimeError("antiword: " + r.stderr.decode(errors="replace")[:200])
+        return r.stdout.decode("utf-8", "replace"), "doc"
+
+
 # --------------------------------------------------------------------------
 # HTML -> texto
 # --------------------------------------------------------------------------
@@ -784,6 +816,9 @@ def resolver(url: str, via: str, profundidad: int = 0, robots: bool = True) -> t
     datos, cab, _ = _bajar_crudo(url, comprobar_robots=robots)
     if es_pdf(datos):
         return texto_de_pdf(datos)
+    word = es_word(datos)
+    if word:
+        return texto_de_word(datos, word)
 
     pagina = _decodificar(datos, cab)
     texto, enlaces = html_a_texto(pagina)
