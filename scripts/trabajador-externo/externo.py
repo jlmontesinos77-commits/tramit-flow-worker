@@ -401,47 +401,59 @@ def _bajar_crudo(url: str, comprobar_robots: bool = True, maximo: int = MAX_BYTE
 _CON_SESION: set[str] = set()
 
 
-def _cookies_de(host: str) -> int:
-    return sum(1 for c in COOKIES if host.endswith(c.domain.lstrip(".")))
-
-
-def calentar_sesion(url: str, robots: bool) -> bool:
-    """Visita la carpeta del documento, la primera carpeta del sitio y la
-    portada (en ese orden, hasta recibir cookie) para tener sesion en el host.
-    Una sola vez por host y ejecucion. Devuelve True si hay cookie nueva."""
+def _rutas_de_sesion(url: str) -> tuple[str, list[str]]:
     u = urllib.parse.urlsplit(url)
-    host, origen = u.hostname or "", f"{u.scheme}://{u.netloc}"
-    if origen in _CON_SESION:
-        return False
-    _CON_SESION.add(origen)
-    antes = _cookies_de(host)
+    origen = f"{u.scheme}://{u.netloc}"
     trozos = [x for x in u.path.split("/") if x]
     rutas = ["/" + "/".join(trozos[:-1]) + "/" if len(trozos) > 1 else "/",
              "/" + trozos[0] + "/" if trozos else "/", "/"]
-    for ruta in dict.fromkeys(rutas):
+    return origen, list(dict.fromkeys(rutas))
+
+
+def calentar_y_repetir(url: str, robots: bool, maximo: int):
+    """Portales que solo sirven el documento a una sesion abierta en la
+    aplicacion (SITUA de la Junta de Andalucia, visores JSF): visita la carpeta
+    del documento, la primera carpeta del sitio y la portada, y DESPUES DE CADA
+    UNA vuelve a pedir el documento. Se para en cuanto llega un PDF o un Word.
+
+    06/10: antes se decidia por "ha llegado una cookie nueva", y eso fallaba
+    justo en SITUA: el primer intento sin sesion ya rebota a una pagina de
+    error que pone JSESSIONID, asi que la visita a /situadifusion/ (que abre la
+    aplicacion y deja la sesion valida) no anadia cookie, no se repetia la
+    descarga y el documento quedaba como "texto vacio". Lo que dice si la
+    sesion vale es el documento, no el numero de cookies.
+    Una vez por host y ejecucion; devuelve None si no hay manera."""
+    origen, rutas = _rutas_de_sesion(url)
+    if origen in _CON_SESION:
+        return None
+    _CON_SESION.add(origen)
+    for ruta in rutas:
         try:
             _bajar_crudo(origen + ruta, comprobar_robots=robots, maximo=4 * 1024 * 1024)
         except (Vetado, HostSaturado):
             raise
         except Exception as e:
             log("   sesion:", origen + ruta, "->", e)
-        if _cookies_de(host) > antes:
-            log("   sesion recibida en", origen + ruta)
-            return True
-    return False
+        datos, cab, cod = _bajar_crudo(url, comprobar_robots=robots, maximo=maximo)
+        if es_pdf(datos) or es_word(datos):
+            log("   sesion valida tras visitar", origen + ruta)
+            return datos, cab, cod
+    return None
 
 
 def bajar_documento(url: str, robots: bool = True, maximo: int = MAX_BYTES):
     """Como _bajar_crudo, pero si lo que llega es una pagina casi vacia en vez
-    del documento, pide sesion al portal y repite una vez."""
+    del documento, abre sesion en el portal y repite."""
     datos, cab, cod = _bajar_crudo(url, comprobar_robots=robots, maximo=maximo)
     if es_pdf(datos) or es_word(datos):
         return datos, cab, cod
     tipo = (cab.get("Content-Type") or "").lower() if cab else ""
     if "html" in tipo and len(datos) < 300_000:
         texto, _ = html_a_texto(_decodificar(datos, cab))
-        if texto_util(texto) < 1500 and calentar_sesion(url, robots):
-            return _bajar_crudo(url, comprobar_robots=robots, maximo=maximo)
+        if texto_util(texto) < 1500:
+            otra = calentar_y_repetir(url, robots, maximo)
+            if otra:
+                return otra
     return datos, cab, cod
 
 
