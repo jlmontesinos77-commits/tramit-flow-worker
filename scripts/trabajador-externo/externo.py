@@ -935,6 +935,30 @@ def hacer_pdf(p: dict):
     log("   ->", json.dumps(res, ensure_ascii=False)[:300])
 
 
+def hacer_ficha(f: dict):
+    """06/10: fichas de sedes que cortan a la IP de Supabase (Murcia). Es
+    rastreo automatico: se respeta robots.txt y la pausa por servidor. Solo se
+    baja el HTML; lo lee pf-catalogo-supra con su lector de siempre."""
+    url = f["url"]
+    log(f"ficha {url}")
+    try:
+        datos, cab, _ = _bajar_crudo(url, comprobar_robots=True, maximo=4 * 1024 * 1024)
+        tipo = (cab.get("Content-Type") or "") if cab else ""
+        if tipo and not re.search(r"html|xml", tipo, re.I):
+            raise RuntimeError(f"no es una pagina: {tipo[:60]}")
+        pagina = _decodificar(datos, cab)
+        res = puerta({"modo": "ficha_html", "url": url, "html": pagina, "final_url": url})
+    except HostSaturado as e:
+        # la puerta la vuelve a dar a las 3 h; no hace falta soltarla
+        log("   sede saturada, se deja:", e)
+        return
+    except Vetado as e:
+        res = puerta({"modo": "ficha_html", "url": url, "error": "robots: " + str(e)[:250]})
+    except Exception as e:
+        res = puerta({"modo": "ficha_html", "url": url, "error": str(e)[:300]})
+    log("   ->", json.dumps(res, ensure_ascii=False)[:200])
+
+
 def contar():
     try:
         r = puerta({"modo": "contar"})
@@ -946,7 +970,9 @@ def contar():
     # Cada carril (textos / pdfs) solo arranca si hay trabajo de lo suyo.
     quiere_textos = int(os.environ.get("MAX_TEXTOS", "10")) > 0
     quiere_pdfs = int(os.environ.get("MAX_PDFS", "2")) > 0
-    hay = bool((quiere_textos and r.get("textos")) or (quiere_pdfs and r.get("pdfs")))
+    # Las fichas de sede (HTML ligero) van con el carril de textos.
+    hay = bool((quiere_textos and (r.get("textos") or r.get("fichas_html")))
+               or (quiere_pdfs and r.get("pdfs")))
     salida = os.environ.get("GITHUB_OUTPUT")
     if salida:
         with open(salida, "a") as fh:
@@ -969,14 +995,18 @@ def trabajar():
                 r = puerta({"modo": "tareas",
                             "max_textos": int(os.environ.get("MAX_TEXTOS", "10")),
                             "max_pdfs": int(os.environ.get("MAX_PDFS", "2")),
-                            "admite": ["solo_comprimir", "trocear"]})
+                            # fichas de sede: solo el carril de textos
+                            "max_fichas": int(os.environ.get("MAX_FICHAS", "40"))
+                                          if int(os.environ.get("MAX_TEXTOS", "10")) > 0 else 0,
+                            "admite": ["solo_comprimir", "trocear", "fichas", "sin_robots"]})
             except PuertaNoDisponible as e:
                 # Lo ya hecho esta devuelto; lo que no se ha tomado sigue en la cola.
                 print(f"::warning::la puerta no responde, se para aqui ({str(e)[:200]})")
                 break
             textos, pdfs = r.get("textos") or [], r.get("pdfs") or []
-            log(f"ronda {ronda}: {len(textos)} textos, {len(pdfs)} pdfs")
-            if not textos and not pdfs:
+            fichas = r.get("fichas_html") or []
+            log(f"ronda {ronda}: {len(textos)} textos, {len(pdfs)} pdfs, {len(fichas)} fichas")
+            if not textos and not pdfs and not fichas:
                 break
             EN_MANO["textos"].update(t["id"] for t in textos)
             EN_MANO["pdfs"].update(p["documento_id"] for p in pdfs)
@@ -991,6 +1021,15 @@ def trabajar():
                 except Exception as e:
                     print(f"::warning::texto {t.get('id')}: {type(e).__name__}: {str(e)[:200]}", flush=True)
                 EN_MANO["textos"].discard(t["id"])
+            for f in fichas:
+                if queda() < 15 * 60:
+                    break  # las no bajadas vuelven solas a las 3 h
+                try:
+                    hacer_ficha(f)
+                except PuertaNoDisponible as e:
+                    log("   no se ha podido devolver:", str(e)[:200])
+                except Exception as e:
+                    print(f"::warning::ficha {f.get('url')}: {type(e).__name__}: {str(e)[:200]}", flush=True)
             for p in pdfs:
                 try:
                     hacer_pdf(p)
