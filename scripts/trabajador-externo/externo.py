@@ -126,8 +126,91 @@ CTX = [_ctx_moderno(), _ctx_antiguo()]
 # (como un navegador) y, si un documento llega como pagina, se pide la sesion
 # visitando su carpeta y la portada y se repite una vez (bajar_documento).
 COOKIES = http.cookiejar.CookieJar()
-ABRIDORES = [urllib.request.build_opener(urllib.request.HTTPSHandler(context=c),
-                                         urllib.request.HTTPCookieProcessor(COOKIES)) for c in CTX]
+
+
+def _abridores(ctxs) -> list:
+    return [urllib.request.build_opener(urllib.request.HTTPSHandler(context=c),
+                                        urllib.request.HTTPCookieProcessor(COOKIES)) for c in ctxs]
+
+
+ABRIDORES = _abridores(CTX)
+
+# 06/10: CADENA DE CERTIFICADOS INCOMPLETA. Hay servidores municipales que no
+# mandan el certificado intermedio (ponferrada.org: 31 documentos fallaron con
+# «unable to get local issuer certificate»). El navegador lo completa solo: lee
+# en el certificado del servidor de donde bajar el intermedio (AIA, «CA
+# Issuers») y lo baja. Aqui se hace lo mismo, una vez por host: se baja el
+# intermedio (y el siguiente, si hace falta) y se anade a la verificacion. La
+# verificacion NO se desactiva: el intermedio tiene que encadenar con una raiz
+# de confianza del sistema o la conexion sigue fallando.
+_ABRIDORES_HOST: dict[str, list] = {}
+_AIA_PROBADO: set[str] = set()
+
+
+def _aia_url(cert) -> str | None:
+    from cryptography import x509
+    from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID
+    try:
+        aia = cert.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
+    except x509.ExtensionNotFound:
+        return None
+    for d in aia:
+        if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS:
+            v = d.access_location.value
+            if v.lower().startswith(("http://", "https://")):
+                return v
+    return None
+
+
+def completar_cadena(host: str, puerto: int = 443) -> bool:
+    """Baja los intermedios que el servidor no manda y prepara abridores
+    propios para ese host. True si se ha conseguido algun intermedio."""
+    if host in _AIA_PROBADO:
+        return host in _ABRIDORES_HOST
+    _AIA_PROBADO.add(host)
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+    except ImportError:
+        log("   cadena incompleta en", host, "y falta python3-cryptography para completarla")
+        return False
+    try:
+        actual = x509.load_pem_x509_certificate(ssl.get_server_certificate((host, puerto), timeout=30).encode())
+    except Exception as e:
+        log("   cadena incompleta en", host, "; no se pudo leer su certificado:", e)
+        return False
+    pems: list[str] = []
+    for _ in range(3):
+        if actual.issuer == actual.subject:
+            break
+        u = _aia_url(actual)
+        if not u:
+            break
+        try:
+            with urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": UA}),
+                                        timeout=30, context=CTX[0]) as r:
+                cuerpo = r.read(512 * 1024)
+            siguiente = (x509.load_pem_x509_certificate(cuerpo) if b"-----BEGIN" in cuerpo
+                         else x509.load_der_x509_certificate(cuerpo))
+        except Exception as e:
+            log("   intermedio de", host, "en", u, "->", e)
+            break
+        pems.append(siguiente.public_bytes(Encoding.PEM).decode())
+        actual = siguiente
+    if not pems:
+        return False
+    ctxs = []
+    for base in (_ctx_moderno(), _ctx_antiguo()):
+        base.load_verify_locations(cadata="".join(pems))
+        ctxs.append(base)
+    _ABRIDORES_HOST[host] = _abridores(ctxs)
+    log(f"   {host}: cadena completada con {len(pems)} intermedio(s) bajados del propio certificado")
+    return True
+
+
+def _es_cadena_incompleta(e: Exception) -> bool:
+    t = str(e)
+    return "CERTIFICATE_VERIFY_FAILED" in t and ("local issuer" in t or "issuer certificate" in t)
 
 
 # --------------------------------------------------------------------------
@@ -275,7 +358,10 @@ def _bajar_crudo(url: str, comprobar_robots: bool = True, maximo: int = MAX_BYTE
     if espera > 0:
         time.sleep(espera)
     ultimo_error: Exception | None = None
-    for abridor in ABRIDORES:
+    intentos = list(_ABRIDORES_HOST.get(host) or ABRIDORES)
+    completada = False
+    while intentos:
+        abridor = intentos.pop(0)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*",
                                                        "Accept-Language": "es-ES,es;q=0.9"})
@@ -295,6 +381,10 @@ def _bajar_crudo(url: str, comprobar_robots: bool = True, maximo: int = MAX_BYTE
             break
         except (ssl.SSLError, urllib.error.URLError, ConnectionError, TimeoutError) as e:
             ultimo_error = e
+            if not completada and _es_cadena_incompleta(e) and completar_cadena(host):
+                completada = True
+                intentos = list(_ABRIDORES_HOST[host])
+                continue
             if _es_timeout(e):
                 # un timeout no es cosa del TLS: repetir con el contexto
                 # antiguo solo duplica la espera y la carga del servidor.
@@ -438,6 +528,13 @@ class _Html(html.parser.HTMLParser):
         if tag == "a":
             self._href = dict(attrs).get("href")
             self._txt = []
+        # 06/10: el PDF de un visor va en un iframe/embed/object, no en un enlace
+        # (Gestiona preview-document: <iframe src="/preview/pdf/....pdf">).
+        if tag in ("iframe", "embed", "object"):
+            a = dict(attrs)
+            src = a.get("src") or a.get("data")
+            if src:
+                self.enlaces.append((src, "documento incrustado pdf"))
 
     def handle_endtag(self, tag):
         if tag in self.FUERA and self._fuera:
@@ -711,6 +808,46 @@ def _ocr_trozo(plano: str, salida: str, forzar: bool) -> tuple[int, str]:
     return codigo, nota_acotar
 
 
+def _ocr_resistente(plano: str, salida: str, forzar: bool) -> tuple[int, str]:
+    """_ocr_trozo, y si ocrmypdf revienta con el trozo entero (06/10: el PGOU
+    de San Fernando, «ZeroDivisionError»), se repite pagina a pagina: la que
+    falle se queda como estaba y el resto del documento sale con su texto."""
+    try:
+        return _ocr_trozo(plano, salida, forzar)
+    except RuntimeError as e:
+        n = len(_paginas(plano))
+        if n <= 1:
+            raise
+        log(f"   ocr del trozo entero fallo ({e}); se repite pagina a pagina")
+    d = os.path.dirname(salida) or "."
+    hechos: list[str] = []
+    rotas: list[int] = []
+    codigos: set[int] = set()
+    for i in range(1, n + 1):
+        pag = os.path.join(d, f"pag-{i}.pdf")
+        _qpdf_paginas([plano, str(i)], pag, f"separar la pagina {i}")
+        ocr = os.path.join(d, f"pag-{i}-ocr.pdf")
+        try:
+            c, _ = _ocr_trozo(pag, ocr, forzar)
+            codigos.add(c)
+            os.remove(pag)
+            hechos.append(ocr)
+        except RuntimeError:
+            rotas.append(i)
+            hechos.append(pag)
+    if len(rotas) == n:
+        raise RuntimeError(f"ocrmypdf no puede con ninguna de las {n} paginas")
+    args: list[str] = []
+    for h in hechos:
+        args += [h, "1-z"]
+    _qpdf_paginas(args, salida, "unir las paginas")
+    for h in hechos:
+        os.remove(h)
+    nota = (f"{len(rotas)} pagina(s) sin OCR porque ocrmypdf falla con ellas: "
+            + ",".join(map(str, rotas[:20])) + ("…" if len(rotas) > 20 else "")) if rotas else ""
+    return (0 if 0 in codigos else 6), nota
+
+
 def _qpdf_paginas(args: list[str], salida: str, que: str):
     r = subprocess.run(["qpdf", "--empty", "--pages", *args, "--", salida], capture_output=True, timeout=900)
     if r.returncode not in (0, 3) or not os.path.exists(salida):
@@ -746,7 +883,7 @@ def dar_capa_texto(entrada: str, salida: str, forzar: bool = False) -> str:
 
     n = len(_paginas(plano))
     if n <= PAGINAS_POR_TROZO:
-        codigo, nota_acotar = _ocr_trozo(plano, salida, forzar)
+        codigo, nota_acotar = _ocr_resistente(plano, salida, forzar)
         trozos_nota = ""
     else:
         d = os.path.dirname(salida)
@@ -759,7 +896,7 @@ def dar_capa_texto(entrada: str, salida: str, forzar: bool = False) -> str:
             _qpdf_paginas([plano, f"{desde}-{hasta}"], trozo, f"separar las paginas {desde}-{hasta}")
             ocr = os.path.join(d, f"trozo-{i}-ocr.pdf")
             try:
-                c, na = _ocr_trozo(trozo, ocr, forzar)
+                c, na = _ocr_resistente(trozo, ocr, forzar)
             except RuntimeError as e:
                 raise RuntimeError(f"paginas {desde}-{hasta}: {e}") from None
             codigos.add(c)

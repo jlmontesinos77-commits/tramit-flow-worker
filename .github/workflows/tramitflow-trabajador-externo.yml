@@ -57,7 +57,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            poppler-utils qpdf ghostscript ocrmypdf tesseract-ocr tesseract-ocr-spa antiword
+            poppler-utils qpdf ghostscript ocrmypdf tesseract-ocr tesseract-ocr-spa antiword python3-cryptography
 
       - name: Trabajar
         if: steps.contar.outputs.hay == 'true'
