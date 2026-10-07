@@ -1148,7 +1148,12 @@ def hacer_texto(t: dict):
     a_mano = bool(t.get("a_mano"))
     log(f"texto {t['id']} [{via}]{' [aportado a mano: sin robots.txt]' if a_mano else ''} {url}")
     try:
-        texto, formato = resolver(url, via, robots=not a_mano)
+        # 07/10: de un host que solo deja entrar al ordenador de Jose (la GVA) se
+        # lee la copia que el lector local subio a Storage; la url oficial no cambia.
+        fuente = t.get("copia") or url
+        if fuente != url:
+            log("   se lee la copia local:", fuente)
+        texto, formato = resolver(fuente, via, robots=not a_mano)
         texto = texto.replace("\x00", "")
         if texto_util(texto) < MIN_TEXTO:
             res = puerta({"modo": "texto", "id": t["id"],
@@ -1443,6 +1448,46 @@ def leer_gva(ine: str) -> tuple[list, list]:
 LECTORES_REGISTRO = {"gva": leer_gva}
 
 
+def hacer_copias(limite: int = 20):
+    """Ordenador de Jose (REGISTROS_LOCAL=1): baja los documentos de la cola de
+    los hosts que solo le dejan entrar a el y los sube a Storage, para que el
+    trabajador de GitHub los lea de la copia. Lo que pasa de 49 MB no cabe en el
+    bucket: se cierra con su motivo."""
+    try:
+        r = puerta({"modo": "copias_pendientes", "limite": limite})
+    except PuertaNoDisponible as e:
+        print(f"::warning::la puerta no responde ({str(e)[:200]})")
+        return
+    copias = r.get("copias") or []
+    log(f"copias: {len(copias)} documentos")
+    for c in copias:
+        url = c["url"]
+        log("   copia", url)
+        cuerpo = {"modo": "copia_hecha", "url": url}
+        try:
+            datos, _, _ = bajar_documento(url, robots=True, maximo=MAX_SUBIDA)
+            if not (es_pdf(datos) or es_word(datos)):
+                raise RuntimeError("lo que hay en esa direccion no es un PDF")
+            req = urllib.request.Request(c["subida"], data=datos, method="PUT",
+                                         headers={"Content-Type": "application/pdf", "x-upsert": "true"})
+            try:
+                with urllib.request.urlopen(req, timeout=600, context=CTX[0]) as resp:
+                    resp.read()
+            except urllib.error.HTTPError as e:
+                raise RuntimeError(f"subida {e.code}: {e.read().decode(errors='replace')[:200]}") from None
+            cuerpo.update(ruta=c["ruta"], bytes=len(datos))
+        except HostSaturado as e:
+            log("   servidor saturado, se deja para la proxima:", e)
+            continue
+        except Exception as e:
+            cuerpo["error"] = f"{type(e).__name__}: {str(e)[:250]}"
+        try:
+            log("   ->", json.dumps(puerta(cuerpo), ensure_ascii=False)[:200])
+        except PuertaNoDisponible as e:
+            log("   no se ha podido devolver:", str(e)[:200])
+        time.sleep(PAUSA_MUNICIPIO)
+
+
 def hacer_registros():
     try:
         # REGISTROS_LOCAL=1: este trabajador corre en el ordenador de Jose y toma
@@ -1475,6 +1520,8 @@ def hacer_registros():
             log("   no se ha podido devolver:", str(e)[:200])
         if i < len(turnos) - 1:
             time.sleep(PAUSA_MUNICIPIO)
+    if os.environ.get("REGISTROS_LOCAL") == "1":
+        hacer_copias()
 
 
 def contar():
