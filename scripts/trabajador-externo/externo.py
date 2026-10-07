@@ -1408,7 +1408,10 @@ LECTORES_REGISTRO = {"gva": leer_gva}
 
 def hacer_registros():
     try:
-        r = puerta({"modo": "registro_tomar", "limite": int(os.environ.get("MAX_REGISTROS", "10"))})
+        # REGISTROS_LOCAL=1: este trabajador corre en el ordenador de Jose y toma
+        # los registros que cortan tambien a GitHub (la GVA, 07/10).
+        r = puerta({"modo": "registro_tomar", "limite": int(os.environ.get("MAX_REGISTROS", "10")),
+                    "local": os.environ.get("REGISTROS_LOCAL") == "1"})
     except PuertaNoDisponible as e:
         print(f"::warning::la puerta no responde ({str(e)[:200]})")
         return
@@ -1550,4 +1553,4 @@ if __name__ == "__main__":
     if not CLAVE:
         sys.exit("falta TRABAJADOR_CLAVE")
     orden = sys.argv[1] if len(sys.argv) > 1 else "trabajar"
-    {"contar": contar, "trabajar": trabajar}[orden]()
+    {"contar": contar, "trabajar": trabajar, "registros": hacer_registros}[orden]()
