@@ -31,11 +31,13 @@ from __future__ import annotations
 import html
 import html.parser
 import http.cookiejar
+import faulthandler
 import json
 import os
 import re
 import shutil
 import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -1448,7 +1450,22 @@ def leer_gva(ine: str) -> tuple[list, list]:
 LECTORES_REGISTRO = {"gva": leer_gva}
 
 
-def hacer_copias(limite: int = 20):
+# CARRIL DE REGISTROS EN EL ORDENADOR DE JOSE (07/10). La pasada de las 15:53
+# leyo dos municipios y se quedo parada una hora sin escribir nada, hasta que
+# el Programador de tareas la mato (0xC000013A) y se salto la siguiente. Leida
+# a mano desde otra maquina, Alzira (el tercero) sale en 2,5 minutos: no es el
+# municipio, es una peticion que se queda colgada. Tres cosas:
+#  - un tope de tiempo para la lectura y otro para las copias, por debajo de la
+#    hora que deja la tarea, para que siempre acabe sola y deje sitio a la
+#    siguiente (lo que queda en curso lo devuelve la base a los 30 minutos);
+#  - timeout por defecto en todos los sockets, tambien los que no lo ponen;
+#  - si aun asi algo se cuelga, cada 10 minutos se escribe en el registro donde
+#    esta parado cada hilo, para saber que peticion es.
+REGISTROS_MIN = int(os.environ.get("REGISTROS_MIN", "35"))
+COPIAS_MIN = int(os.environ.get("COPIAS_MIN", "15"))
+
+
+def hacer_copias(limite: int = 20, hasta: float | None = None):
     """Ordenador de Jose (REGISTROS_LOCAL=1): baja los documentos de la cola de
     los hosts que solo le dejan entrar a el y los sube a Storage, para que el
     trabajador de GitHub los lea de la copia. Lo que pasa de 49 MB no cabe en el
@@ -1461,6 +1478,9 @@ def hacer_copias(limite: int = 20):
     copias = r.get("copias") or []
     log(f"copias: {len(copias)} documentos")
     for c in copias:
+        if hasta and time.time() > hasta:
+            log("   tope de tiempo de las copias: el resto, en la proxima pasada")
+            break
         url = c["url"]
         log("   copia", url)
         cuerpo = {"modo": "copia_hecha", "url": url}
@@ -1499,8 +1519,13 @@ def hacer_registros():
         return
     turnos = r.get("turnos") or []
     log(f"registros: {len(turnos)} municipios")
+    hasta = time.time() + REGISTROS_MIN * 60
     for i, t in enumerate(turnos):
         reg, ine = t.get("registro"), t.get("municipio_ine")
+        if time.time() > hasta:
+            log(f"   tope de {REGISTROS_MIN} min de lectura: {len(turnos) - i} municipios para la proxima pasada")
+            break
+        log(f"   {reg} {ine}: leyendo")
         lector = LECTORES_REGISTRO.get(reg)
         cuerpo = {"modo": "registro_guardar", "registro": reg, "municipio_ine": ine}
         try:
@@ -1521,7 +1546,7 @@ def hacer_registros():
         if i < len(turnos) - 1:
             time.sleep(PAUSA_MUNICIPIO)
     if os.environ.get("REGISTROS_LOCAL") == "1":
-        hacer_copias()
+        hacer_copias(hasta=time.time() + COPIAS_MIN * 60)
 
 
 def contar():
@@ -1553,7 +1578,12 @@ def trabajar():
     signal.signal(signal.SIGINT, _cortar)
     if int(os.environ.get("MAX_REGISTROS", "0")) > 0:
         # carril de registros: solo lectura de indices, sin colas de textos ni PDFs
-        hacer_registros()
+        socket.setdefaulttimeout(90)
+        faulthandler.dump_traceback_later(600, repeat=True, file=sys.stdout)
+        try:
+            hacer_registros()
+        finally:
+            faulthandler.cancel_dump_traceback_later()
         return
     ronda = 0
     motivo = "fin de la ejecucion"
