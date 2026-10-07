@@ -41,7 +41,11 @@ jobs:
     env:
       TRABAJADOR_CLAVE: ${{ secrets.TRABAJADOR_CLAVE }}
       PRESUPUESTO_MIN: ${{ inputs.presupuesto_min || '150' }}
-      MAX_TEXTOS: ${{ matrix.carril == 'textos' && '10' || '0' }}
+      # 07/10: lotes pequenos (5 textos), como mucho 4 tandas por hora y 2 min
+      # de pausa entre tandas: no hay prisa y asi no se satura nada.
+      MAX_TEXTOS: ${{ matrix.carril == 'textos' && '5' || '0' }}
+      MAX_RONDAS: '4'
+      PAUSA_RONDA_S: '120'
       MAX_PDFS: ${{ matrix.carril == 'pdfs' && '2' || '0' }}
       MAX_VISTAS: ${{ matrix.carril == 'vistas' && '20' || '0' }}
       MAX_REGISTROS: ${{ matrix.carril == 'registros' && '10' || '0' }}

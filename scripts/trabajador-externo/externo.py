@@ -60,7 +60,13 @@ MAX_BYTES = 300 * 1024 * 1024          # planes generales escaneados: el de Lugo
 MAX_SUBIDA = 49 * 1024 * 1024          # el bucket 'normas' admite 50 MB por fichero
 MIN_TEXTO = 500                         # por debajo, la puerta la cierra como fallida
 PRESUPUESTO_S = int(os.environ.get("PRESUPUESTO_MIN", "150")) * 60
-PAUSA_HOST_S = 1.5                      # cortesia con cada servidor
+PAUSA_HOST_S = 4.0                      # cortesia con cada servidor (07/10: de 1,5 a 4 s)
+# 07/10: espaciar. Una ejecucion ya no trabaja sin parar hasta agotar el
+# presupuesto: hace como mucho MAX_RONDAS tandas, con una pausa entre una y
+# otra. Junto con el tope de 2 documentos por servidor en cada toma (puerta),
+# no se satura ni la base ni ningun portal.
+MAX_RONDAS = int(os.environ.get("MAX_RONDAS", "4"))
+PAUSA_RONDA_S = int(os.environ.get("PAUSA_RONDA_S", "120"))
 OCR_TIMEOUT_S = 40 * 60
 # Un servidor que empieza a dar timeouts suele estar limitando: se le deja
 # respirar y, si sigue, no se le toca mas en esta ejecucion. Las filas que no
@@ -398,7 +404,9 @@ def _bajar_crudo(url: str, comprobar_robots: bool = True, maximo: int = MAX_BYTE
     raise RuntimeError(f"no se ha podido bajar: {ultimo_error}")
 
 
-_CON_SESION: set[str] = set()
+_CON_SESION: dict[str, int] = {}     # aperturas de sesion por host en esta ejecucion
+_SESION_OK: dict[str, bool] = {}       # la ultima apertura trajo el documento
+MAX_APERTURAS_SESION = 6
 
 
 def _rutas_de_sesion(url: str) -> tuple[str, list[str]]:
@@ -422,11 +430,18 @@ def calentar_y_repetir(url: str, robots: bool, maximo: int):
     aplicacion y deja la sesion valida) no anadia cookie, no se repetia la
     descarga y el documento quedaba como "texto vacio". Lo que dice si la
     sesion vale es el documento, no el numero de cookies.
-    Una vez por host y ejecucion; devuelve None si no hay manera."""
+    07/10: la sesion CADUCA. Antes se abria una sola vez por host y ejecucion,
+    y cuando SITUA la cerraba a mitad de tanda los 96 documentos siguientes
+    salian como «texto vacio (157 chars, html)». Ahora se vuelve a abrir
+    mientras la apertura anterior haya servido, hasta MAX_APERTURAS_SESION
+    por host; si una apertura no trae el documento, no se insiste mas.
+    Devuelve None si no hay manera."""
     origen, rutas = _rutas_de_sesion(url)
-    if origen in _CON_SESION:
+    n = _CON_SESION.get(origen, 0)
+    if n >= MAX_APERTURAS_SESION or (n > 0 and not _SESION_OK.get(origen)):
         return None
-    _CON_SESION.add(origen)
+    _CON_SESION[origen] = n + 1
+    _SESION_OK[origen] = False
     for ruta in rutas:
         try:
             _bajar_crudo(origen + ruta, comprobar_robots=robots, maximo=4 * 1024 * 1024)
@@ -437,6 +452,7 @@ def calentar_y_repetir(url: str, robots: bool, maximo: int):
         datos, cab, cod = _bajar_crudo(url, comprobar_robots=robots, maximo=maximo)
         if es_pdf(datos) or es_word(datos):
             log("   sesion valida tras visitar", origen + ruta)
+            _SESION_OK[origen] = True
             return datos, cab, cod
     return None
 
@@ -953,6 +969,23 @@ def ajustar_tamano(ruta: str, d: str) -> tuple[str, str]:
     raise RuntimeError(f"la copia pesa {os.path.getsize(ruta) // 1048576} MB incluso recomprimida y el bucket admite 50 MB")
 
 
+def paginas_sin_texto(t: str) -> bool:
+    """07/10: PORTADA CON TEXTO Y EL RESTO ESCANEADO. Muchas ordenanzas llevan
+    la portada (o la diligencia) en texto y el articulado como imagen:
+    pdftotext saca la portada, pasa de 2.000 caracteres y no se hacia OCR, asi
+    que la norma salia «sin articulos suficientes». Si al menos un tercio de
+    las paginas (y dos o mas) no traen texto, toca OCR; ocrmypdf --skip-text
+    respeta las paginas que ya lo tienen."""
+    pags = t.split("\f")
+    if pags and not pags[-1].strip():
+        pags = pags[:-1]
+    if len(pags) < 2:
+        return False
+    # «sin texto»: menos de 80 caracteres utiles (un sello o una firma)
+    vacias = sum(1 for x in pags if texto_util(x) < 80)
+    return vacias >= 2 and vacias >= len(pags) / 3
+
+
 def texto_de_pdf(datos: bytes) -> tuple[str, str]:
     with tempfile.TemporaryDirectory() as d:
         f = os.path.join(d, "doc.pdf")
@@ -960,7 +993,7 @@ def texto_de_pdf(datos: bytes) -> tuple[str, str]:
             fh.write(datos)
         t, modo = pdftotext(f)
         roto = texto_util(t) >= 2000 and ilegible(t)
-        if texto_util(t) >= 2000 and not roto:
+        if texto_util(t) >= 2000 and not roto and not paginas_sin_texto(t):
             return t, modo
         o = os.path.join(d, "ocr.pdf")
         if roto:
@@ -971,12 +1004,16 @@ def texto_de_pdf(datos: bytes) -> tuple[str, str]:
             if not ilegible(t2):
                 return t2, modo2 + "+ocr forzado"
             return t, modo
-        # sin capa de texto (o casi): OCR
-        log("   sin capa de texto, OCR…")
-        dar_capa_texto(f, o)
+        # Paginas con solo un sello o una linea de firma (la Diputacion, el
+        # PDFCreator de Benalmadena: 61 caracteres por pagina y el resto
+        # imagen): --skip-text las salta porque «ya tienen texto» y el OCR no
+        # sacaba nada. Si la mayoria de paginas estan asi, se fuerza el OCR.
+        forzar = paginas_sin_texto(t)
+        log("   sin capa de texto" + (" (paginas con solo un sello), OCR forzado…" if forzar else ", OCR…"))
+        dar_capa_texto(f, o, forzar=forzar)
         t2, modo2 = pdftotext(o)
         if texto_util(t2) > texto_util(t):
-            return t2, modo2 + "+ocr"
+            return t2, modo2 + ("+ocr forzado" if forzar else "+ocr")
         return t, modo
 
 
@@ -1474,7 +1511,9 @@ def trabajar():
     ronda = 0
     motivo = "fin de la ejecucion"
     try:
-        while queda() > 20 * 60:  # sin margen para un OCR largo no se toma nada mas
+        while queda() > 20 * 60 and ronda < MAX_RONDAS:  # sin margen para un OCR largo no se toma nada mas
+            if ronda > 0:
+                time.sleep(PAUSA_RONDA_S)  # 07/10: tandas espaciadas
             ronda += 1
             try:
                 # "admite": lo que sabe hacer esta version. La puerta no le da
