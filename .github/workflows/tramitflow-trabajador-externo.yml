@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        carril: [textos, pdfs, vistas, registros]
+        carril: [textos, pdfs, vistas, registros, hojas]
     concurrency:
       group: tramitflow-trabajador-externo-${{ matrix.carril }}
       cancel-in-progress: false
@@ -49,6 +49,12 @@ jobs:
       MAX_PDFS: ${{ matrix.carril == 'pdfs' && '2' || '0' }}
       MAX_VISTAS: ${{ matrix.carril == 'vistas' && '20' || '0' }}
       MAX_REGISTROS: ${{ matrix.carril == 'registros' && '10' || '0' }}
+      # 17/10: hojas de las normas en PDF (el PDF se baja una vez, no cada 24
+      # paginas como en la edge function) y recompresion sin perdida de los PNG
+      # ya guardados en el bucket.
+      MAX_HOJAS: ${{ matrix.carril == 'hojas' && '4' || '0' }}
+      MAX_RECOMPRIMIR: ${{ matrix.carril == 'hojas' && '200' || '0' }}
+      HOJAS_MIN: '150'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,8 +65,14 @@ jobs:
         id: contar
         run: python3 scripts/trabajador-externo/externo.py contar
 
+      - name: Instalar poppler y optipng (hojas)
+        if: steps.contar.outputs.hay == 'true' && matrix.carril == 'hojas'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends poppler-utils optipng
+
       - name: Instalar poppler, qpdf y ocrmypdf
-        if: steps.contar.outputs.hay == 'true' && matrix.carril != 'registros'
+        if: steps.contar.outputs.hay == 'true' && matrix.carril != 'registros' && matrix.carril != 'hojas'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \

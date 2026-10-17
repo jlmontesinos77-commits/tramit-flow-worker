@@ -54,6 +54,11 @@ PUERTA = os.environ.get(
     "TRAMITFLOW_PUERTA",
     "https://bblvjqekflyytsfneisd.supabase.co/functions/v1/pf-trabajador-externo",
 )
+# 17/10: hojas y recompresion van por su propia puerta (misma clave).
+PUERTA_HOJAS = os.environ.get(
+    "TRAMITFLOW_PUERTA_HOJAS",
+    "https://bblvjqekflyytsfneisd.supabase.co/functions/v1/pf-trabajador-hojas",
+)
 CLAVE = os.environ.get("TRABAJADOR_CLAVE", "")
 UA_TOKEN = "TramitFlow"
 UA = "Mozilla/5.0 (compatible; TramitFlow-externo/1.0; +https://kolven.es)"
@@ -239,7 +244,7 @@ class PuertaNoDisponible(Exception):
     pass
 
 
-def puerta(cuerpo: dict, timeout: int = 120) -> dict:
+def puerta(cuerpo: dict, timeout: int = 120, destino: str | None = None) -> dict:
     datos = json.dumps(cuerpo).encode()
     ultimo = ""
     for intento, espera in enumerate((0, *ESPERAS_PUERTA)):
@@ -247,7 +252,7 @@ def puerta(cuerpo: dict, timeout: int = 120) -> dict:
             log(f"   puerta: {ultimo[:160]} -> reintento en {espera} s")
             time.sleep(espera)
         req = urllib.request.Request(
-            PUERTA, data=datos, method="POST",
+            destino or PUERTA, data=datos, method="POST",
             headers={"Content-Type": "application/json", "x-trabajador-clave": CLAVE},
         )
         try:
@@ -1552,6 +1557,225 @@ def hacer_registros():
         hacer_copias(hasta=time.time() + COPIAS_MIN * 60)
 
 
+# --------------------------------------------------------------------------
+# 17/10: CARRIL DE HOJAS. Las hojas rasterizadas de las normas en PDF (lo que
+# enseña el visor para ver tablas y dibujos tal como se publicaron) las hacia la
+# edge function pf-hoja-pdf, de 12 en 12 o de 24 en 24 paginas porque el worker
+# de Supabase no da para mas, y cada llamada volvia a bajar el PDF ENTERO del
+# bucket: un PDF de 472 paginas se bajaba 40 veces. Era la mayor parte del
+# Cached Egress del proyecto. Aqui el PDF se baja UNA vez y salen todas sus
+# hojas.
+#
+# Las hojas salen con pdftoppm a la misma resolucion que las de pf-hoja-pdf
+# (escala 1,35 = 97,2 ppp) y pasan por optipng, SIN PERDIDA: si la hoja es gris
+# se guarda en gris, si tiene pocos colores, con paleta. El pixel es el mismo.
+#
+# Y lo ya guardado: el mismo carril recomprime los PNG del bucket (hojas,
+# figuras, tablas...) que hizo el codificador antiguo (RGBA sin filtro). Solo se
+# sube la version nueva si pesa menos; la ruta no cambia, asi que nada de lo que
+# la apunta se entera.
+# --------------------------------------------------------------------------
+HOJA_PPP = 97.2                       # = escala 1,35 de pf-hoja-pdf
+HOJAS_TROZO = 40                      # hojas por entrega a la puerta (el avance queda apuntado)
+HOJAS_MIN = int(os.environ.get("HOJAS_MIN", "120"))
+MAX_HOJAS_DOCS = int(os.environ.get("MAX_HOJAS", "0"))
+MAX_RECOMPRIMIR = int(os.environ.get("MAX_RECOMPRIMIR", "0"))
+HILOS_PNG = max(1, (os.cpu_count() or 2))
+GANANCIA_MIN = 0.97                   # recomprimir: si no baja al menos un 3 %, no se sube
+
+
+def _optipng(ruta: str) -> None:
+    # -o2: medido con una hoja real del codificador antiguo, 292 KB -> 136 KB
+    # en 0,7 s (-o1 se quedaba en 182 KB; -o3 tarda el doble y no gana nada).
+    # -strip all quita metadatos que nadie usa. Reduce sola a gris o a paleta
+    # cuando se puede, sin perdida.
+    subprocess.run(["optipng", "-quiet", "-o2", "-strip", "all", ruta],
+                   check=True, timeout=300)
+
+
+def _png_medidas(ruta: str) -> tuple[int, int]:
+    with open(ruta, "rb") as fh:
+        cab = fh.read(24)
+    return int.from_bytes(cab[16:20], "big"), int.from_bytes(cab[20:24], "big")
+
+
+def _subir_png(url_subida: str, datos: bytes) -> None:
+    req = urllib.request.Request(url_subida, data=datos, method="PUT",
+                                 headers={"Content-Type": "image/png", "x-upsert": "true"})
+    for espera in (0, 5, 20):
+        if espera:
+            time.sleep(espera)
+        try:
+            with urllib.request.urlopen(req, timeout=120, context=CTX[0]) as r:
+                r.read()
+            return
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                raise RuntimeError(f"subida {e.code}: {e.read().decode(errors='replace')[:200]}") from None
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            pass
+    raise RuntimeError("subida: el Storage no responde")
+
+
+def _paginas_pdf(ruta: str) -> int:
+    r = subprocess.run(["pdfinfo", ruta], capture_output=True, timeout=120)
+    m = re.search(rb"^Pages:\s+(\d+)", r.stdout, re.M)
+    if not m:
+        raise RuntimeError("pdfinfo no da el numero de paginas")
+    return int(m.group(1))
+
+
+def ph(cuerpo: dict, timeout: int = 120) -> dict:
+    return puerta(cuerpo, timeout, destino=PUERTA_HOJAS)
+
+
+def hacer_hoja_doc(t: dict, hasta: float) -> None:
+    iid = t["instrumento_id"]
+    log(f"hojas {iid} desde la {t.get('desde', 1)}")
+    from concurrent.futures import ThreadPoolExecutor
+    try:
+        propio = "bblvjqekflyytsfneisd.supabase.co/" in t["descarga"]
+        datos, _, _ = bajar_documento(t["descarga"], robots=not propio)
+        if not es_pdf(datos):
+            raise RuntimeError("la descarga no es un PDF")
+        with tempfile.TemporaryDirectory() as d:
+            pdf = os.path.join(d, "in.pdf")
+            with open(pdf, "wb") as fh:
+                fh.write(datos)
+            del datos
+            total = _paginas_pdf(pdf)
+            p = max(1, int(t.get("desde") or 1))
+            while p <= total:
+                if time.time() > hasta:
+                    log(f"   tope de tiempo en la hoja {p} de {total}: sigue en la proxima pasada")
+                    ph({"modo": "hojas_hecho", "instrumento_id": iid, "documento_id": t["documento_id"],
+                            "total": total, "paginas": [], "soltar": True})
+                    return
+                fin = min(p + HOJAS_TROZO - 1, total)
+                sal = os.path.join(d, f"t{p}")
+                os.makedirs(sal, exist_ok=True)
+                subprocess.run(["pdftoppm", "-png", "-r", str(HOJA_PPP), "-f", str(p), "-l", str(fin),
+                                pdf, os.path.join(sal, "h")], check=True, timeout=1800,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # pdftoppm numera con ceros segun el total: se lee el numero del nombre
+                hechas = {}
+                for nombre in os.listdir(sal):
+                    m = re.search(r"-(\d+)\.png$", nombre)
+                    if m:
+                        hechas[int(m.group(1))] = os.path.join(sal, nombre)
+                with ThreadPoolExecutor(HILOS_PNG) as ex:
+                    list(ex.map(_optipng, hechas.values()))
+                r = ph({"modo": "hojas_subidas", "instrumento_id": iid, "paginas": sorted(hechas)})
+                subidas = r.get("subidas") or {}
+                filas = []
+
+                def subir(pag: int):
+                    ruta = hechas[pag]
+                    with open(ruta, "rb") as fh:
+                        _subir_png(subidas[str(pag)]["url"], fh.read())
+                    w, h = _png_medidas(ruta)
+                    return {"pagina": pag, "ruta": subidas[str(pag)]["ruta"], "ancho": w, "alto": h,
+                            "bytes": os.path.getsize(ruta)}
+                with ThreadPoolExecutor(4) as ex:
+                    filas = list(ex.map(subir, sorted(hechas)))
+                res = ph({"modo": "hojas_hecho", "instrumento_id": iid, "documento_id": t["documento_id"],
+                              "total": total, "paginas": filas})
+                kb = sum(f["bytes"] for f in filas) // max(1, len(filas)) // 1024
+                log(f"   hojas {p}-{fin} de {total} ({kb} KB por hoja) ->",
+                    json.dumps(res, ensure_ascii=False)[:160])
+                shutil.rmtree(sal, ignore_errors=True)
+                p = fin + 1
+    except HostSaturado as e:
+        log("   servidor saturado, se suelta:", e)
+        ph({"modo": "hojas_hecho", "instrumento_id": iid, "documento_id": t["documento_id"],
+                "paginas": [], "soltar": True})
+    except Exception as e:
+        res = ph({"modo": "hojas_hecho", "instrumento_id": iid, "documento_id": t["documento_id"],
+                      "paginas": [], "error": f"{type(e).__name__}: {str(e)[:250]}"})
+        log("   error ->", json.dumps(res, ensure_ascii=False)[:200])
+
+
+def hacer_recompresion(hasta: float) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    total_antes = total_despues = n = 0
+    while time.time() < hasta:
+        try:
+            r = ph({"modo": "recomprimir_tomar", "limite": MAX_RECOMPRIMIR})
+        except PuertaNoDisponible as e:
+            print(f"::warning::la puerta no responde ({str(e)[:200]})")
+            return
+        objs = r.get("objetos") or []
+        if not objs:
+            break
+        resultados = []
+
+        def uno(o: dict) -> dict:
+            out = {"ruta": o["ruta"]}
+            try:
+                datos, _, _ = bajar_documento(o["descarga"], robots=False, maximo=60 * 1024 * 1024)
+                if datos[:8] != b"\x89PNG\r\n\x1a\n":
+                    raise RuntimeError("no es un PNG")
+                with tempfile.TemporaryDirectory() as d:
+                    f = os.path.join(d, "x.png")
+                    with open(f, "wb") as fh:
+                        fh.write(datos)
+                    _optipng(f)
+                    nuevo = os.path.getsize(f)
+                    out["antes"] = len(datos)
+                    if nuevo <= len(datos) * GANANCIA_MIN:
+                        with open(f, "rb") as fh:
+                            _subir_png(o["subida"], fh.read())
+                        out["despues"] = nuevo
+                    else:
+                        out["despues"] = len(datos)   # no compensa: se queda como estaba
+            except Exception as e:
+                out["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+            return out
+        with ThreadPoolExecutor(HILOS_PNG * 2) as ex:
+            resultados = list(ex.map(uno, objs))
+        try:
+            res = ph({"modo": "recomprimir_hecho", "objetos": resultados})
+        except PuertaNoDisponible as e:
+            log("   no se ha podido devolver:", str(e)[:200])
+            return
+        a = sum(x.get("antes", 0) for x in resultados)
+        b = sum(x.get("despues", 0) for x in resultados)
+        total_antes += a
+        total_despues += b
+        n += len(resultados)
+        log(f"recomprimir: {len(resultados)} PNG, {a // 1048576} MB -> {b // 1048576} MB ->",
+            json.dumps(res, ensure_ascii=False)[:160])
+    if n:
+        log(f"recomprimir total: {n} PNG, {total_antes // 1048576} MB -> {total_despues // 1048576} MB")
+
+
+def hacer_hojas() -> None:
+    hasta = INICIO + HOJAS_MIN * 60
+    if MAX_HOJAS_DOCS > 0:
+        while time.time() < hasta:
+            try:
+                r = ph({"modo": "hojas_tomar", "limite": MAX_HOJAS_DOCS})
+            except PuertaNoDisponible as e:
+                print(f"::warning::la puerta no responde ({str(e)[:200]})")
+                break
+            docs = r.get("documentos") or []
+            log(f"hojas: {len(docs)} documentos")
+            if not docs:
+                break
+            for t in docs:
+                if time.time() > hasta:
+                    ph({"modo": "hojas_hecho", "instrumento_id": t["instrumento_id"],
+                            "documento_id": t["documento_id"], "paginas": [], "soltar": True})
+                    continue
+                try:
+                    hacer_hoja_doc(t, hasta)
+                except PuertaNoDisponible as e:
+                    log("   no se ha podido devolver:", str(e)[:200])
+    # Con el tiempo que quede, lo ya guardado.
+    if MAX_RECOMPRIMIR > 0 and time.time() < hasta:
+        hacer_recompresion(hasta)
+
+
 def contar():
     try:
         r = puerta({"modo": "contar"})
@@ -1565,11 +1789,21 @@ def contar():
     quiere_pdfs = int(os.environ.get("MAX_PDFS", "2")) > 0
     quiere_vistas = int(os.environ.get("MAX_VISTAS", "0")) > 0
     quiere_registros = int(os.environ.get("MAX_REGISTROS", "0")) > 0
+    quiere_hojas = MAX_HOJAS_DOCS > 0 or MAX_RECOMPRIMIR > 0
+    if quiere_hojas:
+        try:
+            rh = ph({"modo": "contar"})
+        except Exception as e:
+            print(f"::warning::la puerta de hojas no responde ({str(e)[:200]})")
+            rh = {}
+        log("contar hojas:", rh)
+        r["hojas"] = (MAX_HOJAS_DOCS > 0 and rh.get("hojas")) or (MAX_RECOMPRIMIR > 0 and rh.get("recomprimir"))
     # Las fichas de sede (HTML ligero) van con el carril de textos.
     hay = bool((quiere_textos and (r.get("textos") or r.get("fichas_html")))
                or (quiere_pdfs and r.get("pdfs"))
                or (quiere_vistas and r.get("vistas"))
-               or (quiere_registros and r.get("registros")))
+               or (quiere_registros and r.get("registros"))
+               or (quiere_hojas and r.get("hojas")))
     salida = os.environ.get("GITHUB_OUTPUT")
     if salida:
         with open(salida, "a") as fh:
@@ -1579,6 +1813,11 @@ def contar():
 def trabajar():
     signal.signal(signal.SIGTERM, _cortar)
     signal.signal(signal.SIGINT, _cortar)
+    if MAX_HOJAS_DOCS > 0 or MAX_RECOMPRIMIR > 0:
+        # carril de hojas: rasterizado y recompresion, sin las otras colas
+        socket.setdefaulttimeout(120)
+        hacer_hojas()
+        return
     if int(os.environ.get("MAX_REGISTROS", "0")) > 0:
         # carril de registros: solo lectura de indices, sin colas de textos ni PDFs
         socket.setdefaulttimeout(90)
