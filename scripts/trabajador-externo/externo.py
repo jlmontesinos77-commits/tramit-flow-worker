@@ -654,6 +654,15 @@ def ilegible(t: str) -> bool:
     o un anexo, no baja de ahi."""
     # Solo palabras de dos letras o mas: la basura se parte en letras sueltas
     # («d», «l», «o») que coincidirian con articulos y conjunciones.
+    # 17/10: FUENTE SIN TABLA DE CARACTERES QUE SALE COMO CIFRAS Y SIGNOS (la
+    # ordenanza del mercado de Motril: 42.000 caracteres de «47828586631:5681…» y
+    # un 1 % de letras). Ahi no hay palabras que contar y se daba por legible. Un
+    # texto de verdad, aunque sea una tabla de tarifas, no baja del 45 % de letras.
+    sin_blancos = re.sub(r"\s", "", t)
+    if len(sin_blancos) >= 2000:
+        letras = len(re.findall(r"[A-Za-zÁÉÍÓÚÀÈÌÒÙÜÑÇáéíóúàèìòùüñç·]", sin_blancos))
+        if letras / len(sin_blancos) < 0.45:
+            return True
     palabras = [w for w in re.findall(r"[a-záéíóúàèìòùüñç·]+", t.lower()) if len(w) >= 2]
     if len(palabras) < 300:
         return False
