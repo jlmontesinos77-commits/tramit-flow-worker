@@ -65,9 +65,9 @@ UA = "Mozilla/5.0 (compatible; TramitFlow-externo/1.0; +https://kolven.es)"
 
 MAX_BYTES = 300 * 1024 * 1024          # planes generales escaneados: el de Lugo pesa 198 MB
 MAX_SUBIDA = 49 * 1024 * 1024          # copias con capa de texto: se comprimen si pasan de esto
-# 17/10: el bucket 'normas' admite 150 MB. Las copias que sube el PC de Jose de los hosts
+# 17/10: el bucket 'normas' admite 200 MB (el limite global de Storage). Las copias que sube el PC de Jose de los hosts
 # que solo le dejan entrar a el pueden llegar hasta ahi; se borran en cuanto se leen.
-MAX_COPIA_LOCAL = 149 * 1024 * 1024
+MAX_COPIA_LOCAL = 199 * 1024 * 1024
 MIN_TEXTO = 500                         # por debajo, la puerta la cierra como fallida
 PRESUPUESTO_S = int(os.environ.get("PRESUPUESTO_MIN", "150")) * 60
 PAUSA_HOST_S = 4.0                      # cortesia con cada servidor (07/10: de 1,5 a 4 s)
@@ -1476,7 +1476,7 @@ COPIAS_MIN = int(os.environ.get("COPIAS_MIN", "15"))
 def hacer_copias(limite: int = 20, hasta: float | None = None):
     """Ordenador de Jose (REGISTROS_LOCAL=1): baja los documentos de la cola de
     los hosts que solo le dejan entrar a el y los sube a Storage, para que el
-    trabajador de GitHub los lea de la copia. Lo que pasa de 149 MB no cabe en el
+    trabajador de GitHub los lea de la copia. Lo que pasa de 199 MB no cabe en el
     bucket: se cierra con su motivo."""
     try:
         r = puerta({"modo": "copias_pendientes", "limite": limite})
