@@ -1024,7 +1024,19 @@ def texto_de_pdf(datos: bytes) -> tuple[str, str]:
         t2, modo2 = pdftotext(o)
         if texto_util(t2) > texto_util(t):
             return t2, modo2 + ("+ocr forzado" if forzar else "+ocr")
-        return t, modo
+        # 17/10: UNA HOJA CON CABECERA EN TEXTO Y EL CUERPO ESCANEADO (las hojas de
+        # beneficios fiscales de Cordoba: 300 caracteres de cabecera y la tabla como
+        # imagen). --skip-text salta la pagina porque «ya tiene texto», el OCR no saca
+        # nada y el documento salia «vacio» sin haberse leido la imagen. Si sigue
+        # corto, se fuerza el OCR antes de darlo por vacio.
+        if not forzar and texto_util(t) < 2000:
+            log("   el OCR normal no saca nada, OCR forzado…")
+            o2 = os.path.join(d, "ocr-forzado.pdf")
+            dar_capa_texto(f, o2, forzar=True)
+            t3, modo3 = pdftotext(o2)
+            if texto_util(t3) > texto_util(t) and not ilegible(t3):
+                return t3, modo3 + "+ocr forzado"
+        return t, modo + ("+ocr" if not forzar else "+ocr forzado")
 
 
 # --------------------------------------------------------------------------

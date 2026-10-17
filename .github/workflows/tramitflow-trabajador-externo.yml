@@ -12,6 +12,8 @@ name: TramitFlow - trabajador externo
 #   - textos: normas y documentos municipales (descarga, lectura, OCR si hace falta)
 #   - pdfs:   copias con capa de texto de PDFs ya guardados y fichas de ambito
 #   - vistas: copia ligera (150 ppp) de cada plano, para verlo en pantalla
+#   - estructura: paginado y bloques (tablas, figuras) de los PDF grandes, que
+#     en el edge de Supabase se mueren por tiempo o memoria (Deno, mismo calculo)
 # Si no hay trabajo, cada carril termina en segundos sin instalar nada. Si una
 # ejecucion sigue en marcha, la siguiente espera (no se pisan).
 
@@ -32,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        carril: [textos, pdfs, vistas, registros, hojas]
+        carril: [textos, pdfs, vistas, registros, hojas, estructura]
     concurrency:
       group: tramitflow-trabajador-externo-${{ matrix.carril }}
       cancel-in-progress: false
@@ -55,6 +57,10 @@ jobs:
       MAX_HOJAS: ${{ matrix.carril == 'hojas' && '4' || '0' }}
       MAX_RECOMPRIMIR: ${{ matrix.carril == 'hojas' && '200' || '0' }}
       HOJAS_MIN: '150'
+      # 17/10: paginado y bloques de los PDF grandes (scripts/trabajador-externo/estructura.ts)
+      MAX_PAGINADO: ${{ matrix.carril == 'estructura' && '3' || '0' }}
+      MAX_BLOQUES: ${{ matrix.carril == 'estructura' && '2' || '0' }}
+      ESTRUCTURA_MIN: '150'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,7 +69,24 @@ jobs:
       # Si no hay trabajo termina aqui, sin instalar nada.
       - name: Hay trabajo?
         id: contar
+        if: matrix.carril != 'estructura'
         run: python3 scripts/trabajador-externo/externo.py contar
+
+      # Carril de estructura: Deno (el mismo calculo que las edge functions).
+      - name: Instalar Deno (estructura)
+        if: matrix.carril == 'estructura'
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Hay trabajo? (estructura)
+        id: contar_e
+        if: matrix.carril == 'estructura'
+        run: deno run -A scripts/trabajador-externo/estructura.ts contar
+
+      - name: Trabajar (estructura)
+        if: matrix.carril == 'estructura' && steps.contar_e.outputs.hay == 'true'
+        run: deno run -A scripts/trabajador-externo/estructura.ts trabajar
 
       - name: Instalar poppler y optipng (hojas)
         if: steps.contar.outputs.hay == 'true' && matrix.carril == 'hojas'
