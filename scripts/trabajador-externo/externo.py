@@ -1494,6 +1494,68 @@ REGISTROS_MIN = int(os.environ.get("REGISTROS_MIN", "35"))
 COPIAS_MIN = int(os.environ.get("COPIAS_MIN", "15"))
 
 
+class _Navegador:
+    """19/10: HOSTS QUE SOLO DEJAN ENTRAR A UN NAVEGADOR DE VERDAD (granada.org).
+    Su cortafuegos mira la huella de la conexion, no las cabeceras: da 403 a
+    GitHub, al lector del PC con cabeceras de Chrome e incluso a Chrome sin
+    ventana. Con el Chrome de Jose con ventana (Playwright, channel="chrome") si
+    entra. La ventana se abre fuera de la pantalla y se cierra al acabar las
+    copias. Solo en el ordenador de Jose y solo cuando la descarga normal da 403."""
+
+    def __init__(self):
+        self.pw = self.b = self.ctx = self.pg = None
+        self.portadas: set[str] = set()
+
+    def disponible(self) -> bool:
+        if os.environ.get("REGISTROS_LOCAL") != "1" or os.environ.get("COPIAS_NAVEGADOR", "1") != "1":
+            return False
+        try:
+            import playwright.sync_api  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def bajar(self, url: str, maximo: int) -> bytes:
+        if self.pw is None:
+            from playwright.sync_api import sync_playwright
+            self.pw = sync_playwright().start()
+            self.b = self.pw.chromium.launch(channel="chrome", headless=False,
+                                             args=["--window-position=-32000,-32000", "--window-size=900,700"])
+            self.ctx = self.b.new_context(accept_downloads=True)
+            self.pg = self.ctx.new_page()
+        p = urllib.parse.urlsplit(url)
+        base = f"{p.scheme}://{p.netloc}/"
+        if base not in self.portadas:
+            # Entrar por la portada: el cortafuegos da la cookie de sesion ahi.
+            self.pg.goto(base, wait_until="domcontentloaded", timeout=60000)
+            self.portadas.add(base)
+        with self.pg.expect_download(timeout=300000) as d:
+            self.pg.evaluate("u => { const a = document.createElement('a'); a.href = u; a.download = 'doc';"
+                             " document.body.appendChild(a); a.click(); a.remove(); }", url)
+        dl = d.value
+        with tempfile.TemporaryDirectory() as dd:
+            ruta = os.path.join(dd, "doc")
+            dl.save_as(ruta)
+            if os.path.getsize(ruta) > maximo:
+                raise RuntimeError(f"fichero mayor de {maximo // 1048576} MB")
+            with open(ruta, "rb") as fh:
+                return fh.read()
+
+    def cerrar(self):
+        try:
+            if self.b:
+                self.b.close()
+            if self.pw:
+                self.pw.stop()
+        except Exception:
+            pass
+        self.pw = self.b = self.ctx = self.pg = None
+        self.portadas.clear()
+
+
+NAVEGADOR = _Navegador()
+
+
 def hacer_copias(limite: int = 20, hasta: float | None = None):
     """Ordenador de Jose (REGISTROS_LOCAL=1): baja los documentos de la cola de
     los hosts que solo le dejan entrar a el y los sube a Storage, para que el
@@ -1514,7 +1576,14 @@ def hacer_copias(limite: int = 20, hasta: float | None = None):
         log("   copia", url)
         cuerpo = {"modo": "copia_hecha", "url": url}
         try:
-            datos, _, _ = bajar_documento(url, robots=True, maximo=MAX_COPIA_LOCAL)
+            try:
+                datos, _, _ = bajar_documento(url, robots=True, maximo=MAX_COPIA_LOCAL)
+            except Exception as e:
+                # 403 de un cortafuegos que solo deja pasar a un navegador: se repite con el Chrome de Jose.
+                if "403" not in str(e) or not NAVEGADOR.disponible():
+                    raise
+                log("   403: se baja con el navegador")
+                datos = NAVEGADOR.bajar(url, MAX_COPIA_LOCAL)
             if not (es_pdf(datos) or es_word(datos)):
                 raise RuntimeError("lo que hay en esa direccion no es un PDF")
             req = urllib.request.Request(c["subida"], data=datos, method="PUT",
@@ -1535,6 +1604,7 @@ def hacer_copias(limite: int = 20, hasta: float | None = None):
         except PuertaNoDisponible as e:
             log("   no se ha podido devolver:", str(e)[:200])
         time.sleep(PAUSA_MUNICIPIO)
+    NAVEGADOR.cerrar()
 
 
 def hacer_registros():
