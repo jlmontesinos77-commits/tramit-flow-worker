@@ -52,12 +52,12 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 PUERTA = os.environ.get(
     "TRAMITFLOW_PUERTA",
-    "https://bblvjqekflyytsfneisd.supabase.co/functions/v1/pf-trabajador-externo",
+    "https://iqskiegwxucfuimnnoiu.supabase.co/functions/v1/pf-trabajador-externo",
 )
 # 17/10: hojas y recompresion van por su propia puerta (misma clave).
 PUERTA_HOJAS = os.environ.get(
     "TRAMITFLOW_PUERTA_HOJAS",
-    "https://bblvjqekflyytsfneisd.supabase.co/functions/v1/pf-trabajador-hojas",
+    "https://iqskiegwxucfuimnnoiu.supabase.co/functions/v1/pf-trabajador-hojas",
 )
 CLAVE = os.environ.get("TRABAJADOR_CLAVE", "")
 UA_TOKEN = "TramitFlow"
@@ -1725,7 +1725,7 @@ def hacer_hoja_doc(t: dict, hasta: float) -> None:
     log(f"hojas {iid} desde la {t.get('desde', 1)}")
     from concurrent.futures import ThreadPoolExecutor
     try:
-        propio = "bblvjqekflyytsfneisd.supabase.co/" in t["descarga"]
+        propio = "iqskiegwxucfuimnnoiu.supabase.co/" in t["descarga"]
         datos, _, _ = bajar_documento(t["descarga"], robots=not propio)
         if not es_pdf(datos):
             raise RuntimeError("la descarga no es un PDF")
