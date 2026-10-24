@@ -34,7 +34,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        carril: [textos, pdfs, vistas, registros, hojas, estructura]
+        # 24/10 (Jose): cinco carriles de textos en paralelo. El repo es publico
+        # y GitHub no cobra; el plan admite 20 trabajos a la vez en la cuenta.
+        # La cola ya impide mas de 2 descargas a la vez contra la misma web, y
+        # dos carriles nunca cogen el mismo documento (la toma solo marca lo que
+        # sigue pendiente). Las fichas de sede, solo en el carril «textos».
+        carril: [textos, textos-2, textos-3, textos-4, textos-5, pdfs, vistas, registros, hojas, estructura]
     concurrency:
       group: tramitflow-trabajador-externo-${{ matrix.carril }}
       cancel-in-progress: false
@@ -49,9 +54,10 @@ jobs:
       # carril (la campana de ciudades esta parada porque la cola pasa del tope).
       # Con 5 x 4 = 20 por hora era el cuello de botella de todo lo municipal:
       # se sube a 15 x 8 = hasta 120 por hora, con 1 min entre tandas.
-      MAX_TEXTOS: ${{ matrix.carril == 'textos' && '15' || '0' }}
-      MAX_RONDAS: ${{ matrix.carril == 'textos' && '8' || '4' }}
-      PAUSA_RONDA_S: ${{ matrix.carril == 'textos' && '60' || '120' }}
+      MAX_TEXTOS: ${{ startsWith(matrix.carril, 'textos') && '15' || '0' }}
+      MAX_RONDAS: ${{ startsWith(matrix.carril, 'textos') && '8' || '4' }}
+      PAUSA_RONDA_S: ${{ startsWith(matrix.carril, 'textos') && '60' || '120' }}
+      MAX_FICHAS: ${{ matrix.carril == 'textos' && '40' || '0' }}
       MAX_PDFS: ${{ matrix.carril == 'pdfs' && '2' || '0' }}
       MAX_VISTAS: ${{ matrix.carril == 'vistas' && '20' || '0' }}
       MAX_REGISTROS: ${{ matrix.carril == 'registros' && '10' || '0' }}
