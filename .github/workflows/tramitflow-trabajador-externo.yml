@@ -45,9 +45,13 @@ jobs:
       PRESUPUESTO_MIN: ${{ inputs.presupuesto_min || '150' }}
       # 07/10: lotes pequenos (5 textos), como mucho 4 tandas por hora y 2 min
       # de pausa entre tandas: no hay prisa y asi no se satura nada.
-      MAX_TEXTOS: ${{ matrix.carril == 'textos' && '5' || '0' }}
-      MAX_RONDAS: '4'
-      PAUSA_RONDA_S: '120'
+      # 24/10: Normas en Medium y 1.580 documentos municipales esperando a este
+      # carril (la campana de ciudades esta parada porque la cola pasa del tope).
+      # Con 5 x 4 = 20 por hora era el cuello de botella de todo lo municipal:
+      # se sube a 15 x 8 = hasta 120 por hora, con 1 min entre tandas.
+      MAX_TEXTOS: ${{ matrix.carril == 'textos' && '15' || '0' }}
+      MAX_RONDAS: ${{ matrix.carril == 'textos' && '8' || '4' }}
+      PAUSA_RONDA_S: ${{ matrix.carril == 'textos' && '60' || '120' }}
       MAX_PDFS: ${{ matrix.carril == 'pdfs' && '2' || '0' }}
       MAX_VISTAS: ${{ matrix.carril == 'vistas' && '20' || '0' }}
       MAX_REGISTROS: ${{ matrix.carril == 'registros' && '10' || '0' }}
