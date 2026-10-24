@@ -1556,6 +1556,62 @@ class _Navegador:
 NAVEGADOR = _Navegador()
 
 
+def _pdf_de_ficha(url: str, datos: bytes) -> str | None:
+    """24/10: la direccion de la cola es a veces la FICHA HTML del documento, no
+    el documento (Huelva: /portal/documentos/<nombre>, con el PDF colgando de
+    /sites/default/files/...). Se busca el PDF que enlaza la ficha: si solo hay
+    uno, ese; si hay varios, el que mas palabras comparte con la direccion de la
+    ficha, siempre que gane con claridad. Si no, None (y la fila se cierra con
+    su motivo, que es lo que hacia antes)."""
+    texto = datos.decode("utf-8", errors="replace")
+    vistos: list[str] = []
+    for e in re.findall(r"""href\s*=\s*["']([^"']+?\.pdf(?:\?[^"']*)?)["']""", texto, re.I):
+        u = urllib.parse.urljoin(url, html.unescape(e))
+        if u.startswith(("http://", "https://")) and u not in vistos:
+            vistos.append(u)
+    if len(vistos) == 1:
+        return vistos[0]
+    if not vistos:
+        return None
+    palabras = lambda s: set(re.findall(r"[a-z0-9]{4,}", urllib.parse.unquote(s).lower()))
+    clave = palabras(urllib.parse.urlsplit(url).path)
+    puntos = sorted(((len(clave & palabras(urllib.parse.urlsplit(v).path)), v) for v in vistos), reverse=True)
+    if puntos[0][0] >= 2 and puntos[0][0] > puntos[1][0]:
+        return puntos[0][1]
+    return None
+
+
+def _bajar_copia(url: str) -> bytes:
+    """Baja un documento para la copia local.
+    - 403 de un cortafuegos que solo deja pasar a un navegador: con el Chrome de Jose.
+    - 24/10: direccion http:// que no conecta (El Puerto de Santa Maria: 38 PDF
+      con enlaces viejos en http que hoy solo sirve por https): se repite en https.
+    - 24/10: si llega la ficha HTML del documento, se baja el PDF que enlaza."""
+    try:
+        datos, _, _ = bajar_documento(url, robots=True, maximo=MAX_COPIA_LOCAL)
+    except HostSaturado:
+        raise
+    except Exception as e:
+        if url.startswith("http://") and "no se ha podido bajar" in str(e):
+            log("   http no conecta: se repite en https")
+            datos, _, _ = bajar_documento("https://" + url[len("http://"):], robots=True, maximo=MAX_COPIA_LOCAL)
+        elif "403" in str(e) and NAVEGADOR.disponible():
+            log("   403: se baja con el navegador")
+            datos = NAVEGADOR.bajar(url, MAX_COPIA_LOCAL)
+        else:
+            raise
+    if es_pdf(datos) or es_word(datos):
+        return datos
+    pdf = _pdf_de_ficha(url, datos)
+    if not pdf:
+        raise RuntimeError("lo que hay en esa direccion no es un PDF (ni una ficha que enlace un solo PDF)")
+    log("   es la ficha del documento: se baja el PDF que enlaza", pdf)
+    datos, _, _ = bajar_documento(pdf, robots=True, maximo=MAX_COPIA_LOCAL)
+    if not (es_pdf(datos) or es_word(datos)):
+        raise RuntimeError("la ficha enlaza " + pdf + ", pero lo que hay ahi no es un PDF")
+    return datos
+
+
 def hacer_copias(limite: int = 20, hasta: float | None = None):
     """Ordenador de Jose (REGISTROS_LOCAL=1): baja los documentos de la cola de
     los hosts que solo le dejan entrar a el y los sube a Storage, para que el
@@ -1576,17 +1632,8 @@ def hacer_copias(limite: int = 20, hasta: float | None = None):
         log("   copia", url)
         cuerpo = {"modo": "copia_hecha", "url": url}
         try:
-            try:
-                datos, _, _ = bajar_documento(url, robots=True, maximo=MAX_COPIA_LOCAL)
-            except Exception as e:
-                # 403 de un cortafuegos que solo deja pasar a un navegador: se repite con el Chrome de Jose.
-                if "403" not in str(e) or not NAVEGADOR.disponible():
-                    raise
-                log("   403: se baja con el navegador")
-                datos = NAVEGADOR.bajar(url, MAX_COPIA_LOCAL)
-            if not (es_pdf(datos) or es_word(datos)):
-                raise RuntimeError("lo que hay en esa direccion no es un PDF")
-            req = urllib.request.Request(c["subida"], data=datos, method="PUT",
+            datos = _bajar_copia(url)
+            req =urllib.request.Request(c["subida"], data=datos, method="PUT",
                                          headers={"Content-Type": "application/pdf", "x-upsert": "true"})
             try:
                 with urllib.request.urlopen(req, timeout=600, context=CTX[0]) as resp:
