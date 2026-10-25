@@ -1782,6 +1782,11 @@ def archivar_aportes():
                 destino = f"{base} ({a['id']}){ext}"
             with urllib.request.urlopen(a["descarga"], timeout=120, context=CTX[0]) as resp:
                 datos = resp.read()
+            # 25/10: la pagina se guarda comprimida en el bucket (el cortafuegos de
+            # Supabase corta el HTML suelto); aqui se archiva ya descomprimida.
+            if datos[:2] == b"\x1f\x8b":
+                import gzip
+                datos = gzip.decompress(datos)
             with open(destino, "wb") as fh:
                 fh.write(datos)
             cuerpo["ruta"] = destino
