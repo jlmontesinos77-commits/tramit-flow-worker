@@ -1118,16 +1118,65 @@ def resolver(url: str, via: str, profundidad: int = 0, robots: bool = True) -> t
     # ficha sin articulado: seguir el PDF enlazado (lex.gal -> DOG en castellano
     # o consolidado; BOC Cantabria; repositorio del IEA -> consolidado /f/;
     # boletines con visor)
-    for pdf in _pdfs_enlazados(url, enlaces)[:4]:
+    # 25/10: VIA OFICIAL ALTERNATIVA. Si el robots.txt veta el enlace (el PDF del
+    # BOP de Barcelona, el PDF de lex.gal), no se abandona: se prueba el siguiente
+    # enlace y, en el BOP de Barcelona, el registro de la norma en CIDO, que enlaza
+    # sus publicaciones oficiales en otras direcciones (BOPB por dibaaps, Gaseta,
+    # repositorio municipal...). Cada una con su propio robots.txt.
+    candidatos = _pdfs_enlazados(url, enlaces)[:4]
+    if profundidad == 0:
+        candidatos += _cido_documentos(url, pagina)
+    vetados = []
+    for pdf in candidatos:
         try:
             t, modo = resolver(pdf, via, profundidad + 1, robots)
             if texto_util(t) > texto_util(texto):
                 return t, modo + " (enlazado)"
-        except Vetado:
-            raise
+        except Vetado as e:
+            vetados.append(str(e))
+            log("   enlace vetado", pdf[:120], "->", e)
         except Exception as e:
             log("   enlace", pdf[:120], "->", e)
+    if vetados and texto_util(texto) < MIN_TEXTO:
+        raise Vetado(vetados[0])
     return texto, "html"
+
+
+RX_CIDO = re.compile(r"""href\s*=\s*["'](https?://cido\.diba\.cat/normativa_local/\d+[^"']*)["']""", re.I)
+RX_DOC_CIDO = re.compile(r"(ftpisa|PdfProviderServlet|downloadFile|/bitstream/|\.pdf(\?|$))", re.I)
+
+
+def _cido_documentos(url: str, pagina: str) -> list[str]:
+    """25/10: la ficha de un anuncio del BOP de Barcelona enlaza el registro de la
+    norma en CIDO (Diputacio de Barcelona). De ahi salen las publicaciones de la
+    norma, de la mas reciente a la mas antigua y primero las aprobaciones
+    definitivas. Solo para fichas de bop.diba.cat."""
+    if "bop.diba.cat/" not in url:
+        return []
+    m = RX_CIDO.search(pagina or "")
+    if not m:
+        return []
+    try:
+        datos, cab, _ = bajar_documento(html.unescape(m.group(1)), robots=True)
+    except Exception as e:
+        log("   cido:", e)
+        return []
+    reg = _decodificar(datos, cab)
+    filas = re.split(r"<tr\b", reg, flags=re.I)
+    cand: list[tuple[int, int, str]] = []
+    for i, fila in enumerate(filas):
+        definitiva = bool(re.search(r"definitiv", fila, re.I))
+        for href in re.findall(r"""href\s*=\s*["']([^"']+)["']""", fila, re.I):
+            u = _absoluta(m.group(1), href)
+            if RX_DOC_CIDO.search(u) and "cido.diba.cat" not in u:
+                cand.append((0 if definitiva else 1, -i, u))
+    vistos, out = set(), []
+    for _, _, u in sorted(cand):
+        if u not in vistos:
+            vistos.add(u)
+            out.append(u)
+    log(f"   cido: {len(out)} publicaciones de la norma")
+    return out[:6]
 
 
 # --------------------------------------------------------------------------
