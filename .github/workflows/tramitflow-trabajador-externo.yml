@@ -58,7 +58,7 @@ jobs:
       MAX_RONDAS: ${{ startsWith(matrix.carril, 'textos') && '8' || '4' }}
       PAUSA_RONDA_S: ${{ startsWith(matrix.carril, 'textos') && '60' || '120' }}
       MAX_FICHAS: ${{ matrix.carril == 'textos' && '40' || '0' }}
-      MAX_PDFS: ${{ matrix.carril == 'pdfs' && '2' || '0' }}
+      MAX_PDFS: ${{ matrix.carril == 'pdfs' && '4' || '0' }}
       MAX_VISTAS: ${{ matrix.carril == 'vistas' && '20' || '0' }}
       MAX_REGISTROS: ${{ matrix.carril == 'registros' && '10' || '0' }}
       # 17/10: hojas de las normas en PDF (el PDF se baja una vez, no cada 24

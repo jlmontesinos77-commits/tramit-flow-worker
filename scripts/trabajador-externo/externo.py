@@ -1209,6 +1209,14 @@ def hacer_pdf(p: dict):
         # registrada: si es de fuera, se respeta robots igualmente.
         propio = "supabase.co/storage/" in p["descarga"]
         datos, _, _ = bajar_documento(p["descarga"], robots=not propio)
+        if not es_pdf(datos) and not propio:
+            # 25/10: la direccion oficial es a veces la FICHA HTML del documento
+            # (Benalmadena, Huelva, Sevilla): se sigue el PDF que enlaza, como
+            # hace ya el lector local con las copias.
+            pdf = _pdf_de_ficha(p["descarga"], datos)
+            if pdf:
+                log("   es la ficha del documento: se baja el PDF que enlaza", pdf)
+                datos, _, _ = bajar_documento(pdf, robots=True)
         if not es_pdf(datos):
             raise RuntimeError("la descarga no es un PDF")
         with tempfile.TemporaryDirectory() as d:
