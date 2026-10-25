@@ -1491,7 +1491,21 @@ LECTORES_REGISTRO = {"gva": leer_gva}
 #  - si aun asi algo se cuelga, cada 10 minutos se escribe en el registro donde
 #    esta parado cada hilo, para saber que peticion es.
 REGISTROS_MIN = int(os.environ.get("REGISTROS_MIN", "35"))
-COPIAS_MIN = int(os.environ.get("COPIAS_MIN", "15"))
+# 25/10: las copias van PRIMERO y por tiempo, no por numero. Antes la pasada
+# cogia 20 documentos fijos y solo despues de leer los registros; con la tarea
+# cada 15 minutos, 12 minutos de copias dejan margen y nunca se pisan.
+COPIAS_MIN = int(os.environ.get("COPIAS_MIN", "12"))
+COPIAS_TANDA = int(os.environ.get("COPIAS_TANDA", "10"))
+# Una descarga que no acaba en 2 minutos vuelve a la cola para otra pasada; no
+# bloquea al resto (antes eran 5 minutos por documento colgado).
+NAVEGADOR_ESPERA_S = int(os.environ.get("NAVEGADOR_ESPERA_S", "120"))
+# Perfil propio y persistente del Chrome del lector: guarda las cookies que dan
+# los cortafuegos (y el «no soy un robot» si alguna vez hay que pasarlo a mano)
+# de una pasada a otra. No es el perfil diario de Jose: ese esta en uso mientras
+# su Chrome esta abierto y Chrome no deja abrirlo dos veces.
+NAVEGADOR_PERFIL = os.environ.get("NAVEGADOR_PERFIL", r"C:\TramitFlow\chrome-perfil")
+# Donde el PC archiva las paginas que se suben desde el panel (Aportar a mano).
+SEDES_DIR = os.environ.get("SEDES_DIR", "")
 
 
 class _Navegador:
@@ -1500,10 +1514,18 @@ class _Navegador:
     GitHub, al lector del PC con cabeceras de Chrome e incluso a Chrome sin
     ventana. Con el Chrome de Jose con ventana (Playwright, channel="chrome") si
     entra. La ventana se abre fuera de la pantalla y se cierra al acabar las
-    copias. Solo en el ordenador de Jose y solo cuando la descarga normal da 403."""
+    copias. Solo en el ordenador de Jose y solo cuando la descarga normal da 403.
+
+    25/10: el documento se pide DESDE LA PAGINA (fetch con las cookies de la
+    sesion, por la red del propio Chrome), no como descarga. La descarga de
+    Chrome fallaba con «Download.save_as: canceled» y se quedaba esperando 5
+    minutos cuando el PDF se abria en el visor en vez de descargarse. Si el
+    fetch no vale, se prueba la descarga como antes. Y el perfil es persistente
+    (NAVEGADOR_PERFIL): lo que el cortafuegos concede una vez sirve para las
+    siguientes pasadas."""
 
     def __init__(self):
-        self.pw = self.b = self.ctx = self.pg = None
+        self.pw = self.ctx = self.pg = None
         self.portadas: set[str] = set()
 
     def disponible(self) -> bool:
@@ -1515,21 +1537,59 @@ class _Navegador:
         except Exception:
             return False
 
-    def bajar(self, url: str, maximo: int) -> bytes:
-        if self.pw is None:
-            from playwright.sync_api import sync_playwright
-            self.pw = sync_playwright().start()
-            self.b = self.pw.chromium.launch(channel="chrome", headless=False,
-                                             args=["--window-position=-32000,-32000", "--window-size=900,700"])
-            self.ctx = self.b.new_context(accept_downloads=True)
-            self.pg = self.ctx.new_page()
+    def _abrir(self):
+        if self.pw is not None:
+            return
+        from playwright.sync_api import sync_playwright
+        self.pw = sync_playwright().start()
+        args = ["--window-position=-32000,-32000", "--window-size=900,700"]
+        try:
+            os.makedirs(NAVEGADOR_PERFIL, exist_ok=True)
+            self.ctx = self.pw.chromium.launch_persistent_context(
+                NAVEGADOR_PERFIL, channel="chrome", headless=False, accept_downloads=True, args=args)
+        except Exception as e:
+            log("   perfil persistente no disponible (" + str(e)[:120] + "): sin perfil")
+            b = self.pw.chromium.launch(channel="chrome", headless=False, args=args)
+            self.ctx = b.new_context(accept_downloads=True)
+        self.pg = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+
+    def _portada(self, url: str):
         p = urllib.parse.urlsplit(url)
         base = f"{p.scheme}://{p.netloc}/"
         if base not in self.portadas:
             # Entrar por la portada: el cortafuegos da la cookie de sesion ahi.
             self.pg.goto(base, wait_until="domcontentloaded", timeout=60000)
             self.portadas.add(base)
-        with self.pg.expect_download(timeout=300000) as d:
+
+    def bajar(self, url: str, maximo: int) -> bytes:
+        self._abrir()
+        self._portada(url)
+        try:
+            r = self.pg.evaluate(
+                """async ([u, maximo, espera]) => {
+                    const c = new AbortController();
+                    const t = setTimeout(() => c.abort(), espera);
+                    try {
+                      const r = await fetch(u, { credentials: 'include', signal: c.signal });
+                      if (!r.ok) return { estado: r.status };
+                      const b = new Uint8Array(await r.arrayBuffer());
+                      if (b.length > maximo) return { grande: b.length };
+                      let s = '';
+                      for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+                      return { b64: btoa(s) };
+                    } catch (e) { return { error: String(e) }; } finally { clearTimeout(t); }
+                }""", [url, maximo, NAVEGADOR_ESPERA_S * 1000])
+        except Exception as e:
+            r = {"error": str(e)[:200]}
+        if r.get("b64") is not None:
+            import base64
+            return base64.b64decode(r["b64"])
+        if r.get("grande"):
+            raise RuntimeError(f"fichero mayor de {maximo // 1048576} MB")
+        if r.get("estado"):
+            raise RuntimeError(f"no se ha podido bajar: HTTP {r['estado']} (tambien con el navegador)")
+        log("   el navegador no pudo pedirlo desde la pagina (" + str(r.get("error"))[:120] + "): se descarga")
+        with self.pg.expect_download(timeout=NAVEGADOR_ESPERA_S * 1000) as d:
             self.pg.evaluate("u => { const a = document.createElement('a'); a.href = u; a.download = 'doc';"
                              " document.body.appendChild(a); a.click(); a.remove(); }", url)
         dl = d.value
@@ -1543,13 +1603,13 @@ class _Navegador:
 
     def cerrar(self):
         try:
-            if self.b:
-                self.b.close()
+            if self.ctx:
+                self.ctx.close()
             if self.pw:
                 self.pw.stop()
         except Exception:
             pass
-        self.pw = self.b = self.ctx = self.pg = None
+        self.pw = self.ctx = self.pg = None
         self.portadas.clear()
 
 
@@ -1581,80 +1641,165 @@ def _pdf_de_ficha(url: str, datos: bytes) -> str | None:
     return None
 
 
-def _bajar_copia(url: str) -> bytes:
-    """Baja un documento para la copia local.
-    - 403 de un cortafuegos que solo deja pasar a un navegador: con el Chrome de Jose.
-    - 24/10: direccion http:// que no conecta (El Puerto de Santa Maria: 38 PDF
-      con enlaces viejos en http que hoy solo sirve por https): se repite en https.
-    - 24/10: si llega la ficha HTML del documento, se baja el PDF que enlaza."""
+def _bajar_una(url: str, robots: bool) -> bytes:
+    """Una direccion, con todo lo que sabe el PC: si da 403 se repite con el
+    Chrome; si es http:// y no conecta, se prueba https:// (y si ahi da 403,
+    tambien con el Chrome)."""
     try:
-        datos, _, _ = bajar_documento(url, robots=True, maximo=MAX_COPIA_LOCAL)
-    except HostSaturado:
+        datos, _, _ = bajar_documento(url, robots=robots, maximo=MAX_COPIA_LOCAL)
+        return datos
+    except (HostSaturado, Vetado):
         raise
     except Exception as e:
-        if url.startswith("http://") and "no se ha podido bajar" in str(e):
-            log("   http no conecta: se repite en https")
-            datos, _, _ = bajar_documento("https://" + url[len("http://"):], robots=True, maximo=MAX_COPIA_LOCAL)
-        elif "403" in str(e) and NAVEGADOR.disponible():
-            log("   403: se baja con el navegador")
-            datos = NAVEGADOR.bajar(url, MAX_COPIA_LOCAL)
-        else:
+        err = str(e)
+    # 24/10: direccion http:// que no conecta (El Puerto de Santa Maria: 38 PDF
+    # con enlaces viejos en http que hoy solo sirve por https): se repite en
+    # https. 25/10: SOLO si no conecta; un 403 en http no es «no conecta» (los
+    # 15 de transparencia.granada.org se quedaban sin pasar por el Chrome).
+    if url.startswith("http://") and "no se ha podido bajar" in err and "HTTP " not in err:
+        log("   http no conecta: se repite en https")
+        url = "https://" + url[len("http://"):]
+        try:
+            datos, _, _ = bajar_documento(url, robots=robots, maximo=MAX_COPIA_LOCAL)
+            return datos
+        except (HostSaturado, Vetado):
             raise
+        except Exception as e2:
+            err = str(e2)
+    if "HTTP 403" in err and NAVEGADOR.disponible():
+        log("   403: se baja con el navegador")
+        return NAVEGADOR.bajar(url, MAX_COPIA_LOCAL)
+    raise RuntimeError(err)
+
+
+def _bajar_copia(url: str, robots: bool = True) -> bytes:
+    """Baja un documento para la copia local.
+    - 403 de un cortafuegos que solo deja pasar a un navegador: con el Chrome de Jose.
+    - http:// que no conecta: se repite en https.
+    - 24/10: si llega la ficha HTML del documento, se baja el PDF que enlaza
+      (25/10: tambien con el Chrome si ese PDF da 403).
+    - robots=False en lo aportado a mano por una persona."""
+    datos = _bajar_una(url, robots)
     if es_pdf(datos) or es_word(datos):
         return datos
     pdf = _pdf_de_ficha(url, datos)
     if not pdf:
         raise RuntimeError("lo que hay en esa direccion no es un PDF (ni una ficha que enlace un solo PDF)")
     log("   es la ficha del documento: se baja el PDF que enlaza", pdf)
-    datos, _, _ = bajar_documento(pdf, robots=True, maximo=MAX_COPIA_LOCAL)
+    datos = _bajar_una(pdf, robots)
     if not (es_pdf(datos) or es_word(datos)):
         raise RuntimeError("la ficha enlaza " + pdf + ", pero lo que hay ahi no es un PDF")
     return datos
 
 
-def hacer_copias(limite: int = 20, hasta: float | None = None):
-    """Ordenador de Jose (REGISTROS_LOCAL=1): baja los documentos de la cola de
-    los hosts que solo le dejan entrar a el y los sube a Storage, para que el
-    trabajador de GitHub los lea de la copia. Lo que pasa de 199 MB no cabe en el
-    bucket: se cierra con su motivo."""
+def _copiar(c: dict) -> None:
+    url = c["url"]
+    log("   copia", url)
+    cuerpo = {"modo": "copia_hecha", "url": url}
     try:
-        r = puerta({"modo": "copias_pendientes", "limite": limite})
-    except PuertaNoDisponible as e:
-        print(f"::warning::la puerta no responde ({str(e)[:200]})")
-        return
-    copias = r.get("copias") or []
-    log(f"copias: {len(copias)} documentos")
-    for c in copias:
-        if hasta and time.time() > hasta:
-            log("   tope de tiempo de las copias: el resto, en la proxima pasada")
-            break
-        url = c["url"]
-        log("   copia", url)
-        cuerpo = {"modo": "copia_hecha", "url": url}
-        try:
-            datos = _bajar_copia(url)
-            req =urllib.request.Request(c["subida"], data=datos, method="PUT",
-                                         headers={"Content-Type": "application/pdf", "x-upsert": "true"})
+        datos = _bajar_copia(url, robots=not c.get("a_mano"))
+        req = urllib.request.Request(c["subida"], data=datos, method="PUT",
+                                     headers={"Content-Type": "application/pdf", "x-upsert": "true"})
+        ultimo = None
+        for intento in range(3):  # el bucket a veces contesta 429 (too_many_connections)
             try:
                 with urllib.request.urlopen(req, timeout=600, context=CTX[0]) as resp:
                     resp.read()
+                ultimo = None
+                break
             except urllib.error.HTTPError as e:
-                raise RuntimeError(f"subida {e.code}: {e.read().decode(errors='replace')[:200]}") from None
-            cuerpo.update(ruta=c["ruta"], bytes=len(datos))
-        except HostSaturado as e:
-            log("   servidor saturado, se deja para la proxima:", e)
-            continue
-        except Exception as e:
-            cuerpo["error"] = f"{type(e).__name__}: {str(e)[:250]}"
+                ultimo = RuntimeError(f"subida {e.code}: {e.read().decode(errors='replace')[:200]}")
+                if e.code != 429:
+                    break
+                time.sleep(10 * (intento + 1))
+        if ultimo:
+            raise ultimo
+        cuerpo.update(ruta=c["ruta"], bytes=len(datos))
+    except HostSaturado as e:
+        log("   servidor saturado, se deja para la proxima:", e)
+        return
+    except Exception as e:
+        cuerpo["error"] = f"{type(e).__name__}: {str(e)[:250]}"
+        log("   no se ha podido:", cuerpo["error"])
+    try:
+        log("   ->", json.dumps(puerta(cuerpo), ensure_ascii=False)[:200])
+    except Exception as e:
+        log("   no se ha podido devolver:", str(e)[:200])
+
+
+def hacer_copias(hasta: float):
+    """Ordenador de Jose (REGISTROS_LOCAL=1): baja los documentos de la cola de
+    los hosts que solo le dejan entrar a el y los sube a Storage, para que el
+    trabajador de GitHub los lea de la copia. Lo que pasa de 199 MB no cabe en el
+    bucket: se cierra con su motivo.
+    25/10: por tandas de COPIAS_TANDA hasta que no quede nada o se acabe el
+    tiempo (antes, 20 fijos por pasada)."""
+    total = 0
+    vistos: set[str] = set()
+    try:
+        while time.time() < hasta:
+            try:
+                r = puerta({"modo": "copias_pendientes", "limite": COPIAS_TANDA})
+            except PuertaNoDisponible as e:
+                print(f"::warning::la puerta no responde ({str(e)[:200]})")
+                return
+            copias = [c for c in (r.get("copias") or []) if c["url"] not in vistos]
+            if not copias:
+                break
+            log(f"copias: tanda de {len(copias)} documentos")
+            for c in copias:
+                if time.time() > hasta:
+                    log("   tope de tiempo de las copias: el resto, en la proxima pasada")
+                    break
+                vistos.add(c["url"])
+                _copiar(c)
+                total += 1
+                time.sleep(PAUSA_MUNICIPIO)
+    finally:
+        NAVEGADOR.cerrar()
+        log(f"copias: {total} documentos en esta pasada")
+
+
+def archivar_aportes():
+    """25/10: las paginas subidas desde el panel (Aportar a mano) se guardan en
+    OneDrive: Desarrollo IT\\Normas\\Gestiona u Otras sedes."""
+    if not SEDES_DIR or not os.path.isdir(SEDES_DIR):
+        return
+    try:
+        r = puerta({"modo": "aportes_archivar", "limite": 20})
+    except Exception as e:  # una puerta anterior no conoce el modo: no para la pasada
+        log("   paginas aportadas: la puerta no contesta (" + str(e)[:120] + ")")
+        return
+    for a in r.get("aportes") or []:
+        cuerpo = {"modo": "aporte_archivado", "id": a["id"]}
         try:
-            log("   ->", json.dumps(puerta(cuerpo), ensure_ascii=False)[:200])
-        except PuertaNoDisponible as e:
-            log("   no se ha podido devolver:", str(e)[:200])
-        time.sleep(PAUSA_MUNICIPIO)
-    NAVEGADOR.cerrar()
+            carpeta = os.path.join(SEDES_DIR, re.sub(r'[\\/:*?"<>|]+', " ", a.get("carpeta") or "Otras sedes"))
+            os.makedirs(carpeta, exist_ok=True)
+            nombre = re.sub(r'[\\/:*?"<>|]+', " ", a.get("fichero") or f"pagina-{a['id']}.html").strip()
+            destino = os.path.join(carpeta, nombre)
+            if os.path.exists(destino):
+                base, ext = os.path.splitext(destino)
+                destino = f"{base} ({a['id']}){ext}"
+            with urllib.request.urlopen(a["descarga"], timeout=120, context=CTX[0]) as resp:
+                datos = resp.read()
+            with open(destino, "wb") as fh:
+                fh.write(datos)
+            cuerpo["ruta"] = destino
+            log("   pagina archivada:", destino)
+        except Exception as e:
+            cuerpo["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        try:
+            puerta(cuerpo)
+        except Exception:
+            pass
 
 
 def hacer_registros():
+    # 25/10: en el ordenador de Jose, primero las copias (lo que mas espera) y
+    # las paginas aportadas; despues los registros autonomicos.
+    if os.environ.get("REGISTROS_LOCAL") == "1":
+        archivar_aportes()
+        hacer_copias(hasta=time.time() + COPIAS_MIN * 60)
     try:
         # REGISTROS_LOCAL=1: este trabajador corre en el ordenador de Jose y toma
         # los registros que cortan tambien a GitHub (la GVA, 07/10).
@@ -1691,8 +1836,6 @@ def hacer_registros():
             log("   no se ha podido devolver:", str(e)[:200])
         if i < len(turnos) - 1:
             time.sleep(PAUSA_MUNICIPIO)
-    if os.environ.get("REGISTROS_LOCAL") == "1":
-        hacer_copias(hasta=time.time() + COPIAS_MIN * 60)
 
 
 # --------------------------------------------------------------------------
