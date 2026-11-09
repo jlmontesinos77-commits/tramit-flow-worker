@@ -1470,6 +1470,42 @@ def des_gva(s: str) -> str:
     return t[:-1] if t.endswith("/") else t
 
 
+# 09/11: LO PUBLICADO Y LOS PLANOS DE ORDENACION. Antes solo se listaban las
+# carpetas de normas, ordenanzas y catalogo de los expedientes del planeamiento
+# general. Paso de verdad, Naquera (46178): la Homologacion y Plan Parcial de
+# los Sectores 1 y 3 Industriales (Poligono Los Vientos, zona IBA) solo tiene
+# en el registro "1 APROBACION" con el acuerdo y el BOP de 24/06/2002, y es ese
+# BOP el que trae las normas urbanisticas y la ficha de zona: el sector
+# industrial entero se quedaba sin normativa. Igual las modificaciones de las
+# NNSS de 1989 y 1993 y las homologaciones Algibe S. Vicente, Mont Coeli y
+# Bajo Ermita. Ahora, para cada expediente del general Y del diferido:
+#  - carpetas de normas, ordenanzas y catalogo, como antes;
+#  - si no hay carpeta de normas: lo publicado (BOP, BOE, DOGV) y lo que dice
+#    llevar normas en el nombre (NNUU, ficha de zona), en APROBACION, MEMORIA o
+#    suelto en el expediente, como 'planeamiento';
+#  - los planos de ordenacion (clasificacion, calificacion, delimitacion,
+#    alineaciones, usos, PO), sin los de informacion ni los de redes.
+# Es la misma regla que leerGva en pf-registro-autonomico (kolven-normas).
+GVA_PUBLICACION = re.compile(r"\bbop\b|\bboe\b|\bdogv\b|publicacion")
+GVA_NORMAS_EN_NOMBRE = re.compile(r"\bnnuu\b|\bnormas?\b|ordenanzas?|ficha de zona|\bf\.? ?zona\b")
+GVA_PLANO_ORDENACION = re.compile(r"ordenacion|calificacion|clasificacion|delimitacion|alineaciones|zonificacion|\busos\b|modificacion")
+GVA_PLANO_PO = re.compile(r"\bpo\b")
+GVA_PLANO_REDES = re.compile(r"\bred(es)?\b|saneamiento|\bagua\b|abastecimiento|electrificacion|alumbrado|pluviales")
+GVA_PLANO_INFO = re.compile(r"existentes?\b|estado actual|topografic|parcelario|situacion|\bguia\b|afecciones")
+
+
+def es_plano_ordenacion(nf: str) -> bool:
+    n = _sin_tildes(nf).replace("_", " ")
+    if GVA_PLANO_INFO.search(n):
+        return False
+    return bool(GVA_PLANO_ORDENACION.search(n) or (GVA_PLANO_PO.search(n) and not GVA_PLANO_REDES.search(n)))
+
+
+def es_publicado(nf: str) -> bool:
+    n = _sin_tildes(nf).replace("_", " ")
+    return bool(GVA_PUBLICACION.search(n) or GVA_NORMAS_EN_NOMBRE.search(n))
+
+
 def leer_gva(ine: str) -> tuple[list, list]:
     prov = GVA_PROV.get(ine[:2])
     if not prov:
@@ -1483,13 +1519,19 @@ def leer_gva(ine: str) -> tuple[list, list]:
     mu = raiz + "/" + carpeta.rstrip("/")
     listados, parcial = 1, False
     figuras, docs = [], []
+
+    def doc(fid, nombre, nc, url, nf, clase):
+        docs.append({"figura_id": fid, "doc_id": fid + " / " + nc + " / " + nf, "expediente": nombre,
+                     "ruta": fid + (" / " + nc if nc else ""), "nombre": nf, "url": url, "clase": clase,
+                     # la base solo lo baja si el municipio esta dado de alta
+                     "bajar": True})
+
     for n1 in listar_gva(mu):
         if not n1.endswith("/"):
             continue
         listados += 1
         tipo = des_gva(n1)
         ruta_n1 = mu + "/" + n1[:-1]
-        general = bool(re.match(r"^1\b", tipo)) or "GENERAL" in tipo.upper()
         for exp in listar_gva(ruta_n1):
             if not exp.endswith("/"):
                 continue
@@ -1502,32 +1544,46 @@ def leer_gva(ine: str) -> tuple[list, list]:
                             "estado": "", "adaptacion": "", "url": ruta_exp + "/",
                             "datos": {"tipo": tipo, "codigo": m.group(1) if m else None,
                                       "anio": a.group(1) if a else None}})
-            if not general:
-                continue
-            if listados >= GVA_TOPE_LISTADOS:
+            # el expediente y, como mucho, sus carpetas de normas, aprobacion, memoria y planos
+            if listados + 4 > GVA_TOPE_LISTADOS:
                 parcial = True
                 continue
             listados += 1
-            for carp in listar_gva(ruta_exp):
-                if not carp.endswith("/"):
-                    continue
-                nc = des_gva(carp)
-                if not re.search(r"norma|ordenanza|catalogo", _sin_tildes(nc)):
-                    continue
-                if listados >= GVA_TOPE_LISTADOS:
-                    parcial = True
-                    break
+            entradas = listar_gva(ruta_exp)
+            carpetas = [e for e in entradas if e.endswith("/")]
+            sueltos = [e for e in entradas if e.lower().endswith(".pdf")]
+            normativas = [c for c in carpetas if re.search(r"norma|ordenanza|catalogo", _sin_tildes(des_gva(c)))]
+            for carp in normativas:
                 listados += 1
+                nc = des_gva(carp)
                 ruta_carp = ruta_exp + "/" + carp[:-1]
                 for f in listar_gva(ruta_carp):
-                    if not f.lower().endswith(".pdf"):
-                        continue
+                    if f.lower().endswith(".pdf"):
+                        nf = des_gva(f)
+                        doc(fid, nombre, nc, ruta_carp + "/" + f, nf, clase_registro(nc, nf))
+            if not normativas:
+                for f in sueltos:
                     nf = des_gva(f)
-                    docs.append({"figura_id": fid, "doc_id": fid + " / " + nc + " / " + nf, "expediente": nombre,
-                                 "ruta": fid + " / " + nc, "nombre": nf, "url": ruta_carp + "/" + f,
-                                 "clase": clase_registro(nc, nf),
-                                 # la base solo lo baja si el municipio esta dado de alta
-                                 "bajar": True})
+                    if es_publicado(nf):
+                        doc(fid, nombre, "", ruta_exp + "/" + f, nf, "planeamiento")
+                for carp in [c for c in carpetas if re.search(r"aprobaci|memoria", _sin_tildes(des_gva(c)))]:
+                    listados += 1
+                    nc = des_gva(carp)
+                    ruta_carp = ruta_exp + "/" + carp[:-1]
+                    for f in listar_gva(ruta_carp):
+                        if f.lower().endswith(".pdf"):
+                            nf = des_gva(f)
+                            if es_publicado(nf):
+                                doc(fid, nombre, nc, ruta_carp + "/" + f, nf, "planeamiento")
+            for carp in [c for c in carpetas if re.search(r"\bplanos?\b", _sin_tildes(des_gva(c)))]:
+                listados += 1
+                nc = des_gva(carp)
+                ruta_carp = ruta_exp + "/" + carp[:-1]
+                for f in listar_gva(ruta_carp):
+                    if f.lower().endswith(".pdf"):
+                        nf = des_gva(f)
+                        if es_plano_ordenacion(nf):
+                            doc(fid, nombre, nc, ruta_carp + "/" + f, nf, "plano")
     if parcial and figuras:
         figuras[0]["datos"]["parcial"] = f"tope de {GVA_TOPE_LISTADOS} listados: documentos incompletos"
     return figuras, docs
