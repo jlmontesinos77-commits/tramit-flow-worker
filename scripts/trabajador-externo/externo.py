@@ -512,12 +512,34 @@ def es_pdf(datos: bytes) -> bool:
 
 # 06/10: ordenanzas publicadas en Word (Cadiz: .doc). Antes se leian como PDF
 # y fallaban con «Invalid PDF structure».
+# 17/11: tambien el texto de LibreOffice (.odt). Es un zip con el texto en
+# content.xml y empieza por el fichero «mimetype». Como no se reconocia, se
+# decodificaba como si fuera una pagina web y la puerta recibia los bytes del
+# zip: el Texto Refundido del PGOU de Alcala de Guadaira entro como 2.295
+# «paginas» de basura y el paso 7 se gasto la API en ellas.
 def es_word(datos: bytes) -> str | None:
     if datos[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
         return "doc"
     if datos[:2] == b"PK" and b"word/" in datos[:4096]:
         return "docx"
+    if datos[:2] == b"PK" and (b"application/vnd.oasis.opendocument.text" in datos[:4096]
+                               or b"content.xml" in datos[:65536]):
+        return "odt"
     return None
+
+
+def _texto_de_odt(xml: str) -> str:
+    """content.xml de un .odt a texto: un parrafo o titulo por linea, los
+    tabuladores y saltos de linea como tales, «text:s» como espacios. Las notas
+    al pie y las tablas salen en el orden del documento."""
+    xml = re.sub(r"<text:s(?:\s+text:c=\"(\d+)\")?\s*/>",
+                 lambda m: " " * int(m.group(1) or 1), xml)
+    xml = re.sub(r"<text:tab\s*/>", "\t", xml)
+    xml = re.sub(r"<text:line-break\s*/>", "\n", xml)
+    xml = re.sub(r"</text:(?:p|h)>", "\n", xml)
+    xml = re.sub(r"</table:table-cell>", "\t", xml)
+    xml = re.sub(r"</table:table-row>", "\n", xml)
+    return html.unescape(re.sub(r"<[^>]+>", "", xml))
 
 
 def texto_de_word(datos: bytes, tipo: str) -> tuple[str, str]:
@@ -530,6 +552,12 @@ def texto_de_word(datos: bytes, tipo: str) -> tuple[str, str]:
         xml = re.sub(r"<w:tab/>", "\t", xml)
         t = html.unescape(re.sub(r"<[^>]+>", "", xml))
         return t, "docx"
+    if tipo == "odt":
+        import io
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(datos)) as z:
+            xml = z.read("content.xml").decode("utf-8", "replace")
+        return _texto_de_odt(xml), "odt"
     if not shutil.which("antiword"):
         raise RuntimeError("documento Word .doc y no esta instalado antiword")
     with tempfile.TemporaryDirectory() as d:
